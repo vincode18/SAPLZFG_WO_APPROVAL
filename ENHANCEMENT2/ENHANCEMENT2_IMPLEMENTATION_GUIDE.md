@@ -79,7 +79,7 @@ FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
 
 ```json
 {
-  "request_id": "abc123",
+  "request_id": "UTX-20260514083045-A1B2C3",
   "aufnr":      "0000004711",
   "decision":   "APPROVED",
   "approver":   "alice@unitedtractors.com",
@@ -604,8 +604,9 @@ CLASS teams_in_handler IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    " Generate unique correlation id for this request
-    ev_req_id = cl_system_uuid=>create_uuid_c32_static( ).
+    " Generate unique correlation id  →  e.g. UTX-20260514083045-A1B2C3
+    DATA(lv_uuid) = cl_system_uuid=>create_uuid_c32_static( ).
+    ev_req_id = |{ sy-sysid }-{ sy-datum }{ sy-uzeit }-{ lv_uuid+0(6) }|.
 
     " Build JSON payload
     lv_body = |\{"request_id":"{ ev_req_id }","aufnr":"{ iv_aufnr }",|
@@ -1014,7 +1015,7 @@ Authorization: Basic <base64(TEAMS_API:password)>
 Content-Type: application/json
 
 {
-  "request_id": "TESTREQ0000000000000000000000001",
+  "request_id": "UTX-20260514083045-A1B2C3",
   "aufnr":      "0000004711",
   "decision":   "APPROVED",
   "approver":   "alice@unitedtractors.com",
