@@ -8,7 +8,8 @@
 > Work Order.
 >
 > **What we build:**
-> - **2 DDIC tables** — `ZTWO_APPR_TMS` (business state) + `ZHTTP_IP_AUTH` (IP whitelist)
+> - **1 DDIC table** — `ZTWO_APPR_TMS` (business state)
+> - **IP whitelist** — uses existing table `ZAPIGWACL` (`API_NAME` + `EXT_IP` exact match — already in your system)
 > - **4 Classes** — `ZCL_VND_JSON_TO_ABAP` · `ZCL_BASE_HTTP` · `ZCL_WO_APPR_TEAMS_HTTP` · `ZCL_WO_APPR_TEAMS_HANDLER`
 > - **1 Function Group + 1 FM** — `ZFG_WO_APPR_TEAMS` · `Z_WO_APPR_TEAMS_SEND`
 > - **1 SICF service** — the callback URL Power Automate POSTs to
@@ -21,14 +22,14 @@
 1. [Architecture Overview](#1-architecture-overview)
 2. [Step 1 — Package](#2-step-1--package)
 3. [Step 2 — Table ZTWO_APPR_TMS](#3-step-2--table-ztwo_appr_tms)
-4. [Step 3 — Table ZHTTP_IP_AUTH](#4-step-3--table-zhttp_ip_auth)
+4. [Step 3 — IP Whitelist: existing table ZAPIGWACL](#4-step-3--ip-whitelist-existing-table-zapigwacl)
 5. [Step 4 — Class ZCL_VND_JSON_TO_ABAP](#5-step-4--class-zcl_vnd_json_to_abap)
 6. [Step 5 — Class ZCL_BASE_HTTP](#6-step-5--class-zcl_base_http)
 7. [Step 6 — Class ZCL_WO_APPR_TEAMS_HTTP (Inbound Handler)](#7-step-6--class-zcl_wo_appr_teams_http-inbound-handler)
 8. [Step 7 — Class ZCL_WO_APPR_TEAMS_HANDLER (Outbound Caller)](#8-step-7--class-zcl_wo_appr_teams_handler-outbound-caller)
 9. [Step 8 — Function Group & FM Z_WO_APPR_TEAMS_SEND](#9-step-8--function-group--fm-z_wo_appr_teams_send)
 10. [Step 9 — SICF Service](#10-step-9--sicf-service)
-11. [Step 10 — TVARVC + IP Whitelist](#11-step-10--tvarvc--ip-whitelist)
+11. [Step 10 — TVARVC + ZAPIGWACL entries](#11-step-10--tvarvc--zapigwacl-entries)
 12. [Step 11 — Hook into Screen 0300](#12-step-11--hook-into-screen-0300)
 13. [Step 12 — Test with Postman](#13-step-12--test-with-postman)
 
@@ -125,29 +126,30 @@ Activate.
 
 ---
 
-## 4. Step 3 — Table ZHTTP_IP_AUTH
+## 4. Step 3 — IP Whitelist: existing table ZAPIGWACL
 
-**Transaction: SE11 → Database table → Create**
+> **No new table needed.** Your system already has `ZAPIGWACL` for API gateway
+> IP control. `ZCL_BASE_HTTP` will query this table using the same logic you
+> already have in production:
+>
+> ```abap
+> SELECT SINGLE * FROM zapigwacl
+>   WHERE api_name = i_class_name   " handler class name
+>     AND ext_ip   = i_ip.          " exact caller IP
+> ```
 
-IP whitelist used by `ZCL_BASE_HTTP` to authorise incoming HTTP requests per
-handler class.
+### What to know about ZAPIGWACL
 
-### Field definition
+| Field | Role in IP check |
+|-------|-----------------|
+| `API_NAME` | Mapped to the handler class name (`ZCL_WO_APPR_TEAMS_HTTP`) |
+| `EXT_IP` | Exact incoming IP — **one row per IP** (no ranges) |
 
-| Field | Key | Type | Description |
-|-------|-----|------|-------------|
-| `MANDT` | ✔ | `MANDT` | Client |
-| `CLASS_NAME` | ✔ | `REPID` | Handler class, e.g. `ZCL_WO_APPR_TEAMS_HTTP` |
-| `IP_LOW` | ✔ | `RFCIPV6ADDR` | Start of allowed IP range |
-| `IP_HIGH` | | `RFCIPV6ADDR` | End of range (= `IP_LOW` for a single IP) |
-| `ACTIVE` | | `CHAR1` | `X` = active |
-| `DESCRIPTION` | | `CHAR60` | Free text (e.g. *Azure APIM SEA outbound*) |
+You will add rows for this handler's allowed IPs in **Step 10** after the
+SICF service is created.
 
-- **Delivery class:** `C` (Customizing)
-- **Maintenance:** Yes
-
-After activating, go to **SE54 → Generate table maintenance dialog** so you can
-maintain rows via SM30.
+> ⚠️ `EXT_IP` is an **exact match** — if APIM uses a CIDR range, you must
+> add one row per individual IP that APIM can egress from.
 
 ---
 
@@ -306,19 +308,17 @@ Reusable helper: IP check, JSON serialiser for response, HTTP response builder.
 CLASS zcl_base_http IMPLEMENTATION.
 
   METHOD m_check_ip_auth.
-    e_error = 'X'.  " default: deny
+    " Uses existing table ZAPIGWACL (API_NAME + EXT_IP exact match)
+    " Same logic as your existing production handler
+    DATA lw_extip TYPE zapigwacl.
 
-    SELECT SINGLE @abap_true
-      FROM zhttp_ip_auth
-      INTO @DATA(lv_ok)
-      WHERE mandt      = @sy-mandt
-        AND class_name = @i_class_name
-        AND active     = 'X'
-        AND ip_low    <= @i_ip
-        AND ip_high   >= @i_ip.
+    SELECT SINGLE * FROM zapigwacl
+      INTO lw_extip
+      WHERE api_name = i_class_name
+        AND ext_ip   = i_ip.
 
-    IF sy-subrc = 0.
-      CLEAR e_error.
+    IF sy-subrc <> 0.
+      e_error = 'X'.
     ENDIF.
   ENDMETHOD.
 
@@ -926,7 +926,7 @@ No `SAP_ALL`. No `S_TCODE`.
 
 ---
 
-## 11. Step 10 — TVARVC + IP Whitelist
+## 11. Step 10 — TVARVC + ZAPIGWACL entries
 
 ### 11.1 TVARVC entries (transaction STVARV)
 
@@ -935,19 +935,22 @@ No `SAP_ALL`. No `S_TCODE`.
 | `Z_WO_APPR_APIM_URL` | `P` | `https://aut-sap-apim.azure-api.net/wo-approval/teams-trigger` | APIM endpoint (or direct Flow URL) |
 | `Z_WO_APPR_APIM_KEY` | `P` | `<subscription-key>` | Only if going via APIM |
 
-### 11.2 ZHTTP_IP_AUTH entries (SM30)
+### 11.2 ZAPIGWACL entries (SM30 or SE16 → create)
 
-Add one row per allowed IP range for the callback:
+Add one row **per individual IP** for the callback handler.
+`API_NAME` must match the class name exactly as returned by
+`cl_abap_classdescr=>get_class_name` (after stripping `\CLASS=`).
 
-| CLASS_NAME | IP_LOW | IP_HIGH | ACTIVE | DESCRIPTION |
-|-----------|--------|---------|--------|-------------|
-| `ZCL_WO_APPR_TEAMS_HTTP` | `13.66.140.0` | `13.66.140.255` | `X` | Azure APIM SEA |
-| `ZCL_WO_APPR_TEAMS_HTTP` | `40.74.28.0` | `40.74.31.255` | `X` | Azure APIM SEA |
-| `ZCL_WO_APPR_TEAMS_HTTP` | `127.0.0.1` | `127.0.0.1` | `X` | Local / Postman |
+| API_NAME | EXT_IP | Notes |
+|----------|--------|-------|
+| `ZCL_WO_APPR_TEAMS_HTTP` | `13.66.140.1` | Azure APIM SEA — add each APIM egress IP |
+| `ZCL_WO_APPR_TEAMS_HTTP` | `40.74.28.1` | Azure APIM SEA — add each APIM egress IP |
+| `ZCL_WO_APPR_TEAMS_HTTP` | `127.0.0.1` | Localhost / Postman (DEV only — remove in PRD) |
 
-> For the full current list of Power Automate outbound IPs for your region,
-> see:
-> https://learn.microsoft.com/en-us/power-automate/ip-address-configuration
+> ⚠️ Because `ZAPIGWACL` uses **exact IP match** (not ranges), get the
+> complete list of individual outbound IPs for your APIM instance from:
+> **Azure Portal → APIM → Overview → Public IP addresses**
+> Add one `ZAPIGWACL` row for every IP shown there.
 
 ---
 
@@ -1071,7 +1074,8 @@ Content-Type: application/json
 
 ### 13.3 Postman — blocked IP
 
-Remove `127.0.0.1` from `ZHTTP_IP_AUTH` (or test from an unlisted IP).
+Delete (or deactivate) the `127.0.0.1` row for `ZCL_WO_APPR_TEAMS_HTTP` in
+`ZAPIGWACL`, then re-test from localhost.
 
 **Expected response:**
 ```json
@@ -1094,20 +1098,20 @@ Remove `127.0.0.1` from `ZHTTP_IP_AUTH` (or test from an unlisted IP).
 
 ## Object Summary
 
-| Object | Tx | Type | Purpose |
-|--------|-----|------|---------|
-| `ZTWO_APPR_TMS` | SE11 | Table | Approval state (one row per item per request) |
-| `ZHTTP_IP_AUTH` | SE11 | Table | IP whitelist for SICF handlers |
-| `ZCL_VND_JSON_TO_ABAP` | SE24 | Class | JSON → ABAP deserializer (from ZIP) |
-| `ZCL_BASE_HTTP` | SE24 | Class | IP check + response builder |
-| `ZCL_WO_APPR_TEAMS_HTTP` | SE24 | Class | Inbound: `IF_HTTP_EXTENSION` callback handler |
-| `ZCL_WO_APPR_TEAMS_HANDLER` | SE24 | Class | Outbound: POST to Power Automate |
-| `ZFG_WO_APPR_TEAMS` | SE80 | Function Group | Container for FM |
-| `Z_WO_APPR_TEAMS_SEND` | SE37 | Function Module | Outbound entry point from Screen 0300 |
-| `/sap/bc/zwo_appr_teams/callback` | SICF | ICF service | HTTP endpoint for Power Automate |
-| `Z_WO_APPR_APIM_URL` | STVARV | TVARVC | Flow / APIM URL |
-| `Z_WO_APPR_APIM_KEY` | STVARV | TVARVC | APIM subscription key |
-| `Z_WO_APPR_API` | PFCG | Role | Service user `TEAMS_API` authorization |
+| Object | Tx | Type | Create? | Purpose |
+|--------|-----|------|---------|---------|
+| `ZTWO_APPR_TMS` | SE11 | Table | **New** | Approval state (one row per item per request) |
+| `ZAPIGWACL` | SE16/SM30 | Table | **Exists — add rows** | IP whitelist (`API_NAME` + `EXT_IP` exact match) |
+| `ZCL_VND_JSON_TO_ABAP` | SE24 | Class | **New** (from ZIP) | JSON → ABAP deserializer |
+| `ZCL_BASE_HTTP` | SE24 | Class | **New** | IP check (queries `ZAPIGWACL`) + response builder |
+| `ZCL_WO_APPR_TEAMS_HTTP` | SE24 | Class | **New** | Inbound `IF_HTTP_EXTENSION` callback handler |
+| `ZCL_WO_APPR_TEAMS_HANDLER` | SE24 | Class | **New** | Outbound HTTP POST to Power Automate |
+| `ZFG_WO_APPR_TEAMS` | SE80 | Function Group | **New** | Container for FM |
+| `Z_WO_APPR_TEAMS_SEND` | SE37 | Function Module | **New** | Entry point from Screen 0300 |
+| `/sap/bc/zwo_appr_teams/callback` | SICF | ICF service | **New** | HTTP endpoint for Power Automate |
+| `Z_WO_APPR_APIM_URL` | STVARV | TVARVC | **New entry** | Flow / APIM URL |
+| `Z_WO_APPR_APIM_KEY` | STVARV | TVARVC | **New entry** | APIM subscription key |
+| `Z_WO_APPR_API` | PFCG | Role | **New** | Service user `TEAMS_API` authorization |
 
 ---
 
