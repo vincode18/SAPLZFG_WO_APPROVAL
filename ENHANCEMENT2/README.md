@@ -469,7 +469,51 @@ Copy full method bodies from `ENHANCEMENT2_IMPLEMENTATION_GUIDE.md` Step 6.
 
 **Exceptions:** `HTTP_ERROR`, `PAYLOAD_EMPTY`
 
-Body: instantiates `TEAMS_IN_HANDLER` and calls `send_approval`.
+**Source code:**
+
+```abap
+FUNCTION z_wo_appr_teams_send.
+*"----------------------------------------------------------------------
+*"*"Local Interface:
+*"  IMPORTING
+*"     VALUE(IV_AUFNR) TYPE  AUFNR
+*"     VALUE(IV_REQUESTOR) TYPE  SYUNAME DEFAULT SY-UNAME
+*"     VALUE(IV_APPR_LEVEL) TYPE  CHAR4 DEFAULT 'LVL3'
+*"  TABLES
+*"      IT_ITEMS TYPE  TEAMS_IN_HANDLER=>TT_APPR_LINE
+*"  EXPORTING
+*"     VALUE(EV_REQ_ID) TYPE  CHAR32
+*"     VALUE(EV_HTTP_CODE) TYPE  I
+*"  EXCEPTIONS
+*"      HTTP_ERROR
+*"      PAYLOAD_EMPTY
+*"----------------------------------------------------------------------
+  IF it_items IS INITIAL.
+    RAISE payload_empty.
+  ENDIF.
+
+  DATA: lv_error   TYPE char1,
+        lv_message TYPE string.
+
+  DATA(lo_handler) = NEW teams_in_handler( ).
+
+  lo_handler->send_approval(
+    EXPORTING it_items      = it_items
+              iv_aufnr      = iv_aufnr
+              iv_requestor  = iv_requestor
+              iv_appr_level = iv_appr_level
+    IMPORTING ev_req_id     = ev_req_id
+              ev_http_code  = ev_http_code
+              ev_error      = lv_error
+              ev_message    = lv_message ).
+
+  IF lv_error = 'X'.
+    RAISE http_error.
+  ENDIF.
+
+ENDFUNCTION.
+```
+
 **Activate the FM and the Function Group.**
 
 ### Step 8 — SICF Service (SICF)
@@ -528,13 +572,68 @@ WHEN '&RTMS'.
 **10.3 FORM remind_items_via_teams**
 File: `2. Function_Group/7. includes/LZFG_WO_APPROVALF01.abap`
 
-Add at the end of the file (already included in this repo — see the file).
+Add at the end of the file:
 
-The FORM:
-1. Collects marked Table Control rows into `lt_items`
-2. Reads `ZTWOAPPR.APPROVAL_LVL3` to determine `lv_appr_level`
-3. Calls `Z_WO_APPR_TEAMS_SEND`
-4. Shows success/error status message
+```abap
+*&---------------------------------------------------------------------*
+*& FORM remind_items_via_teams                  [ENHANCEMENT2]
+*&---------------------------------------------------------------------*
+FORM remind_items_via_teams.
+
+  DATA lt_items TYPE teams_in_handler=>tt_appr_line.
+
+  LOOP AT gt_items_tc INTO gs_items_tc WHERE mark = abap_true.
+    APPEND VALUE #(
+      aufnr = gs_items_tc-aufnr
+      werks = gs_items_tc-werks
+      maktx = gs_items_tc-maktx
+      bdmng = gs_items_tc-bdmng
+      meins = gs_items_tc-meins ) TO lt_items.
+  ENDLOOP.
+
+  IF lt_items IS INITIAL.
+    MESSAGE 'Mark at least one item before sending Teams reminder' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  DATA: lv_appr_level TYPE char4,
+        lv_lvl3_done  TYPE char1.
+
+  SELECT SINGLE approval_lvl3 FROM ztwoappr
+    INTO @lv_lvl3_done
+    WHERE aufnr = @gv_aufnr.
+
+  lv_appr_level = COND #( WHEN lv_lvl3_done = 'X' THEN 'LVL1'
+                           ELSE                          'LVL3' ).
+
+  DATA: lv_req_id    TYPE char32,
+        lv_http_code TYPE i.
+
+  CALL FUNCTION 'Z_WO_APPR_TEAMS_SEND'
+    EXPORTING  iv_aufnr      = gv_aufnr
+               iv_requestor  = sy-uname
+               iv_appr_level = lv_appr_level
+    TABLES     it_items      = lt_items
+    IMPORTING  ev_req_id     = lv_req_id
+               ev_http_code  = lv_http_code
+    EXCEPTIONS http_error    = 1
+               payload_empty = 2
+               OTHERS        = 3.
+
+  CASE sy-subrc.
+    WHEN 0.
+      DATA(lv_level_txt) = COND #( WHEN lv_appr_level = 'LVL1'
+                                   THEN 'HO ADM (LVL1)'
+                                   ELSE 'SDH Branch (LVL3)' ).
+      MESSAGE |Teams reminder sent to { lv_level_txt }. Request: { lv_req_id }| TYPE 'S'.
+    WHEN 2.
+      MESSAGE 'No items marked' TYPE 'I'.
+    WHEN OTHERS.
+      MESSAGE |Teams trigger failed — HTTP { lv_http_code }| TYPE 'E'.
+  ENDCASE.
+
+ENDFORM.
+```
 
 ### Step 11 — Test with Postman
 
