@@ -1,85 +1,139 @@
 # ENHANCEMENT2 — Teams / Power Automate Approval Integration
 
-Extends the Work Order Approval system (`SAPLZFG_WO_APPROVAL`) to route
-approval requests through Microsoft Teams via Power Automate.
+Extends Work Order Approval (`SAPLZFG_WO_APPROVAL`) to route approval
+requests through Microsoft Teams via Power Automate and Azure APIM.
 
 ---
 
-## What It Does
+## Table of Contents
 
-When a Helpdesk user clicks **Remind via Teams** (`&RTMS`) on Screen 0300,
-SAP sends selected WO items to Power Automate. The assigned approver receives
-a Teams Adaptive Card and clicks **Approve** or **Reject**. Power Automate
-POSTs the decision back to SAP, which stamps the result in `ZTWOAPPR` and
-`ZTWO_APPR_TMS`.
+1. [Architecture Overview](#1-architecture-overview)
+2. [Approval Logic](#2-approval-logic)
+3. [Sending Data Logic (SAP → Teams)](#3-sending-data-logic-sap--teams)
+4. [Receiving Data from Teams (Teams → SAP)](#4-receiving-data-from-teams-teams--sap)
+5. [Auto-Release Logic (check_and_release)](#5-auto-release-logic-check_and_release)
+6. [Step-by-Step SAP Implementation](#6-step-by-step-sap-implementation)
+7. [Objects Built](#7-objects-built)
+8. [Screen 0300 Changes](#8-screen-0300-changes)
+9. [Quick Setup Checklist](#9-quick-setup-checklist)
+
+---
+
+## 1. Architecture Overview
 
 ```
-Screen 0300 → [Remind via Teams]
-  └── FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
-        └── FM: Z_WO_APPR_TEAMS_SEND  (in ZFG_WO_APPROVAL)
-              └── TEAMS_IN_HANDLER->send_approval()
-                    └── HTTP POST → Azure APIM → Power Automate
-                                          │
-                          Teams Adaptive Card to approver
-                                          │
-                    Power Automate POST → /sap/bc/zwo_appr_teams/callback
-                          └── TEAMS_IN_HANDLER (SICF handler)
-                                └── UPDATE ztwoappr + ztwo_appr_tms
+Screen 0300  →  [Remind via Teams]  (&RTMS)
+  │
+  ▼
+FORM remind_items_via_teams          LZFG_WO_APPROVALF01
+  ├── reads ZTWOAPPR.APPROVAL_LVL3   auto-determine level
+  └── calls Z_WO_APPR_TEAMS_SEND     in ZFG_WO_APPROVAL
+        │
+        ▼
+TEAMS_IN_HANDLER->send_approval()
+  ├── reads TVARVC for APIM URL + key
+  ├── builds JSON payload (request_id, aufnr, appr_level, items[])
+  ├── HTTP POST  ──►  Azure APIM  ──►  Power Automate
+  │                                         │
+  │                               Teams Adaptive Card
+  │                               Approver clicks Approve/Reject
+  │                                         │
+  │                               Power Automate HTTP POST
+  │                                         │
+  ◄─────────────────────────────────────────┘
+  /sap/bc/zwo_appr_teams/callback   (SICF)
+        │
+        ▼
+TEAMS_IN_HANDLER (IF_HTTP_EXTENSION~HANDLE_REQUEST)
+  ├── IP auth  (ZAPIGWACL)
+  ├── parse JSON  (ZCL_VND_JSON_TO_ABAP)
+  ├── update_approval_status()
+  │     ├── ZTWO_APPR_TMS  ← Teams tracking
+  │     └── ZTWOAPPR       ← main approval table (LVL1 or LVL3 flag)
+  └── check_and_release()
+        ├── read RESB (active components)
+        ├── cross-check ZTWOAPPR per MATNR line
+        └── if all approved → BAPI_ALM_ORDER_MAINTAIN RELEASE
 ```
 
 ---
 
-## Approval Levels
+## 2. Approval Logic
 
-| Level | Who approves | Field updated in ZTWOAPPR |
-|-------|-------------|---------------------------|
-| `LVL3` | SDH Branch Plant | `APPROVAL_LVL3`, `APPR_BY_LVL3` |
-| `LVL1` | HO ADM (`viandraf@unitedtractors.com`) | `APPROVAL_LVL1`, `APPR_BY_LVL1` |
+### 2.1 Approval Levels
 
-The system selects the level automatically:
-- If `APPROVAL_LVL3` is blank → sends to **SDH** (`LVL3`)
-- If `APPROVAL_LVL3 = 'X'` → escalates to **HO ADM** (`LVL1`)
+| Level | Actor | Table column set | Trigger |
+|-------|-------|-----------------|---------|
+| `LVL3` | SDH Branch Plant | `ZTWOAPPR.APPROVAL_LVL3 = 'X'` | Workers/Branch sends to SDH |
+| `LVL1` | HO ADM | `ZTWOAPPR.APPROVAL_LVL1 = 'X'` | After SDH approves, escalate to HO |
+
+The system selects the level automatically in `FORM remind_items_via_teams`:
+
+```abap
+SELECT SINGLE approval_lvl3 FROM ztwoappr
+  INTO @lv_lvl3_done WHERE aufnr = @gv_aufnr.
+
+lv_appr_level = COND #( WHEN lv_lvl3_done = 'X'
+                         THEN 'LVL1'    " LVL3 done → send to HO ADM
+                         ELSE 'LVL3' ). " default: send to SDH first
+```
+
+### 2.2 appr_flag Rule (matches existing ZFG_WO_APPROVAL logic)
+
+```
+appr_flag = 'X'  when  ZTWOAPPR.APPROVAL_LVL1 = 'X'
+                    OR  ZTWOAPPR.APPROVAL_LVL3 = 'X'
+```
+
+Both the on-screen display and `check_and_release` use this exact rule.
+
+### 2.3 cmpPlantApproverMap (in Power Automate)
+
+Power Automate uses `appr_level` to look up the approver email:
+
+```json
+{
+  "JKT": "viandraf@unitedtractors.com",
+  "JBI": "demakb@unitedtractors.com",
+  "TBG": "ArisA@unitedtractors.com",
+  "ADM": "viandraf@unitedtractors.com"
+}
+```
+
+- `LVL3` → key = `werks` (e.g. `"JKT"`) → SDH email for that plant
+- `LVL1` → key = `"ADM"` → HO ADM email regardless of plant
+
+### 2.4 Approval State in ZTWOAPPR
+
+| APPROVAL_LVL3 | APPROVAL_LVL1 | Meaning |
+|:---:|:---:|---------|
+| ` ` | ` ` | No approval yet |
+| `X` | ` ` | SDH approved, waiting for HO ADM |
+| ` ` | `X` | HO ADM approved directly (L1/L5 path) |
+| `X` | `X` | Fully approved at both levels |
 
 ---
 
-## Objects Built in This Enhancement
+## 3. Sending Data Logic (SAP → Teams)
 
-| Object | Type | Transaction | Note |
-|--------|------|-------------|------|
-| `ZTWO_APPR_TMS` | Table | SE11 | Teams request tracking |
-| `ZAPIGWACL` | Table rows | SM30 | Add APIM IPs (table already exists) |
-| `ZCL_VND_JSON_TO_ABAP` | Class | SE24 | JSON parser from ZIP |
-| `ZCL_BASE_HTTP` | Class | SE24 | IP auth + response helper |
-| `TEAMS_IN_HANDLER` | Class | SE24 | Single class: inbound ICF + outbound send |
-| `Z_WO_APPR_TEAMS_SEND` | Function Module | SE37 | Added to existing `ZFG_WO_APPROVAL` |
-| `/sap/bc/zwo_appr_teams/callback` | SICF service | SICF | Callback endpoint |
-| `Z_WO_APPR_APIM_URL` | TVARVC entry | STVARV | Power Automate / APIM URL |
-| `Z_WO_APPR_APIM_KEY` | TVARVC entry | STVARV | APIM subscription key |
-| `Z_WO_APPR_API` | Role | PFCG | Assign to service user `TEAMS_API` |
+### 3.1 Trigger
 
----
+Helpdesk user marks items in the Table Control on Screen 0300 and clicks
+**Remind via Teams** (function code `&RTMS`, Shift+F7).
 
-## Files in This Folder
+### 3.2 Call Chain
 
-| File | Description |
-|------|-------------|
-| `README.md` | This file — overview and quick reference |
-| `ENHANCEMENT2.md` | Original design spec (Teams + Azure APIM architecture) |
-| `ENHANCEMENT2_IMPLEMENTATION_GUIDE.md` | Step-by-step SAP build guide (SE11 → SE24 → SE37 → SICF) |
+```
+&RTMS
+  └─ USER_COMMAND_0300 WHEN '&RTMS'
+       └─ PERFORM remind_items_via_teams     [LZFG_WO_APPROVALF01]
+            ├─ BUILD lt_items from gt_items_tc WHERE mark = 'X'
+            ├─ SELECT ZTWOAPPR → determine lv_appr_level
+            └─ CALL FUNCTION 'Z_WO_APPR_TEAMS_SEND'
+                 └─ TEAMS_IN_HANDLER->send_approval( )
+```
 
----
-
-## Screen 0300 Changes
-
-| File | Change |
-|------|--------|
-| `2. Function_Group/3. PAI Modules/USER_COMMAND_0300.abap` | Added `WHEN '&RTMS'. PERFORM remind_items_via_teams.` |
-| `2. Function_Group/7. includes/LZFG_WO_APPROVALF01.abap` | Added `FORM remind_items_via_teams` at end |
-| `2. Function_Group/5. GUI Status/ZSTAT_0300.abap` | Add button `&RTMS` / "Remind via Teams" / Shift+F7 |
-
----
-
-## Request ID Format
+### 3.3 Request ID Format
 
 ```
 UTX-20260514083045-A1B2C3
@@ -88,9 +142,72 @@ UTX-20260514083045-A1B2C3
 └── sy-sysid
 ```
 
+Generated by:
+```abap
+DATA(lv_uuid) = cl_system_uuid=>create_uuid_c32_static( ).
+ev_req_id = |{ sy-sysid }-{ sy-datum }{ sy-uzeit }-{ lv_uuid+0(6) }|.
+```
+
+### 3.4 JSON Payload Sent to Power Automate
+
+```json
+{
+  "request_id": "UTX-20260514083045-A1B2C3",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL3",
+  "requestor":  "JOHN",
+  "items": [
+    { "werks": "JKT", "maktx": "BEARING 6205", "bdmng": "2", "meins": "PC" },
+    { "werks": "JKT", "maktx": "SEAL KIT",     "bdmng": "1", "meins": "ST" }
+  ]
+}
+```
+
+- `appr_level` tells Power Automate which key to use in `cmpPlantApproverMap`
+- `items[]` is built from marked rows in the Table Control (`gt_items_tc`)
+
+### 3.5 TVARVC Configuration
+
+| Entry name | Type | Content |
+|-----------|------|---------|
+| `Z_WO_APPR_APIM_URL` | `P` | Full Power Automate / APIM endpoint URL |
+| `Z_WO_APPR_APIM_KEY` | `P` | Azure APIM subscription key |
+
+Read at runtime in `send_approval`:
+```abap
+SELECT SINGLE low FROM tvarvc INTO @lv_flow_url
+  WHERE name = 'Z_WO_APPR_APIM_URL' AND type = 'P'.
+```
+
+### 3.6 ZTWO_APPR_TMS INSERT (tracking)
+
+One row is inserted per item per send:
+
+| Field | Value |
+|-------|-------|
+| `AUFNR` | Work Order number |
+| `TEAMS_REQ_ID` | Generated `request_id` |
+| `TEAMS_STATUS` | `SENT` |
+| `APPR_LEVEL` | `LVL1` or `LVL3` |
+| `WERKS` | Plant of the item |
+| `SENT_BY` | `sy-uname` |
+| `SENT_AT` | Current timestamp |
+
 ---
 
-## Callback JSON (Power Automate → SAP)
+## 4. Receiving Data from Teams (Teams → SAP)
+
+### 4.1 Endpoint
+
+```
+POST https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+Authorization: Basic <TEAMS_API user>
+Content-Type: application/json
+```
+
+Bound to `TEAMS_IN_HANDLER` via SICF service `/sap/bc/zwo_appr_teams/callback`.
+
+### 4.2 Callback JSON (Power Automate → SAP)
 
 ```json
 {
@@ -106,17 +223,399 @@ UTX-20260514083045-A1B2C3
 
 `decision` accepted values: `APPROVED` · `REJECTED` · `TIMEOUT`
 
+### 4.3 7-Phase Processing in HANDLE_REQUEST
+
+```
+Phase 1 — Read body           server->request->get_cdata()    ← MUST be first
+Phase 2 — IP authorization    ZAPIGWACL: API_NAME=TEAMS_IN_HANDLER, EXT_IP=exact
+Phase 3 — Validate not empty  lv_request IS INITIAL → 400
+Phase 4 — Parse JSON          ZCL_VND_JSON_TO_ABAP->json_to_abap()
+Phase 5 — Validate fields     aufnr + decision required; appr_level default LVL3
+Phase 6 — Business logic      update_approval_status() + check_and_release()
+Phase 7 — JSON response       {"msgty":"S","message":"..."}
+```
+
+### 4.4 update_approval_status — What Gets Written
+
+On `decision = 'APPROVED'`:
+
+**ZTWO_APPR_TMS** (Teams tracking):
+```
+APPR_VALID   = 'X'
+TEAMS_STATUS = 'APPROVED'
+APPR_USER    = <approver email truncated to SYUNAME length>
+APPR_DATE    = sy-datum
+APPR_TIME    = sy-uzeit
+LAST_UPDATED = current timestamp
+WHERE aufnr = iv_aufnr AND teams_req_id = iv_req_id
+```
+
+**ZTWOAPPR** (main approval table — stamped by level):
+
+| `appr_level` | Fields updated |
+|-------------|---------------|
+| `LVL3` | `APPROVAL_LVL3='X'`, `APPR_BY_LVL3`, `APPR_DATE_LVL3`, `APPR_TIME_LVL3` |
+| `LVL1` | `APPROVAL_LVL1='X'`, `APPR_BY_LVL1`, `APPR_DATE_LVL1`, `APPR_TIME_LVL1` |
+
+On `decision = 'REJECTED'` or `'TIMEOUT'`: only ZTWO_APPR_TMS is updated
+(`APPR_VALID = 'R'`); ZTWOAPPR flags are left unchanged.
+
+### 4.5 IP Whitelist (ZAPIGWACL)
+
+```abap
+SELECT SINGLE * FROM zapigwacl
+  WHERE api_name = 'TEAMS_IN_HANDLER'
+    AND ext_ip   = <caller IP>.        " exact match — no ranges
+```
+
+Add one row per Azure APIM outbound IP (get from Azure Portal → APIM → Overview → Public IP addresses).
+
 ---
 
-## Quick Setup Checklist
+## 5. Auto-Release Logic (check_and_release)
+
+Called automatically after every `APPROVED` callback. Releases the WO only
+when **every active RESB component line** carries an approval flag.
+
+### 5.1 Why RESB, not ZTWO_APPR_TMS
+
+`ZTWO_APPR_TMS` tracks Teams *requests* (one row per send), not components.
+The authoritative list of what must be approved is **RESB** — the WO component
+reservation table — joined against **ZTWOAPPR** where the approval flags live.
+
+### 5.2 Logic
+
+```
+1. SELECT RESB WHERE aufnr = iv_aufnr AND xloek = space
+   → lt_resb  (active, non-deleted components)
+
+2. SELECT ZTWOAPPR WHERE aufnr = iv_aufnr
+   → lt_appr  (approval flags per matnr / change_id)
+
+3. LOOP AT lt_resb:
+     READ lt_appr WITH KEY matnr = <resb>-matnr
+                           change_id = <resb>-rspos   ← rspos = change_id
+     FALLBACK: READ lt_appr WITH KEY matnr only
+
+     IF not found  OR  (approval_lvl1 ≠ 'X' AND approval_lvl3 ≠ 'X')
+       RETURN  ← not all approved, skip release
+
+4. All lines passed → BAPI_ALM_ORDER_MAINTAIN RELEASE + SAVE
+   BAPI_TRANSACTION_COMMIT wait = 'X'
+   ev_released = 'X'
+```
+
+### 5.3 Approval Rule (matches existing appr_flag derivation)
+
+```abap
+IF <appr>-approval_lvl1 <> 'X' AND <appr>-approval_lvl3 <> 'X'.
+  RETURN.  " this line not yet approved
+ENDIF.
+```
+
+Consistent with `LZFG_WO_APPROVALF03`:
+```abap
+IF ls_item-l1_approved = 'X' OR ls_item-l3_approved = 'X'.
+  ls_item-appr_flag = 'X'.
+ENDIF.
+```
+
+---
+
+## 6. Step-by-Step SAP Implementation
+
+Follow these steps in order. Each step references the transaction and the
+object to create or modify.
+
+### Step 1 — Package (SE21 / SE80)
+
+Create package `ZWO_APPR_TEAMS` (or reuse `ZWO_APPROVAL`).
+All new objects go into this package on the same transport request.
+
+### Step 2 — Table ZTWO_APPR_TMS (SE11)
+
+`SE11 → Database table → Create → ZTWO_APPR_TMS`
+
+| Field | Key | Domain/Type | Description |
+|-------|:---:|-------------|-------------|
+| `MANDT` | ✔ | `MANDT` | Client |
+| `AUFNR` | ✔ | `AUFNR` | Work Order |
+| `TEAMS_REQ_ID` | ✔ | `CHAR32` | Correlation ID |
+| `APPR_VALID` | | `CHAR1` | `X`=Approved · `R`=Rejected |
+| `TEAMS_STATUS` | | `CHAR10` | `SENT`/`APPROVED`/`REJECTED`/`TIMEOUT` |
+| `APPR_LEVEL` | | `CHAR4` | `LVL1` or `LVL3` |
+| `WERKS` | | `WERKS_D` | Plant |
+| `APPR_USER` | | `SYUNAME` | Who approved in Teams |
+| `APPR_DATE` | | `DATS` | Decision date |
+| `APPR_TIME` | | `TIMS` | Decision time |
+| `SENT_BY` | | `SYUNAME` | Helpdesk user |
+| `SENT_AT` | | `TIMESTAMPL` | Send timestamp |
+| `LAST_UPDATED` | | `TIMESTAMPL` | Last status change |
+
+Settings: Delivery class `A`, Data class `APPL1`, Size `0`.
+Secondary index `Z01` on `TEAMS_REQ_ID` (non-unique). **Activate.**
+
+### Step 3 — IP Whitelist: existing ZAPIGWACL (SM30)
+
+No new table. Add rows via `SM30 → ZAPIGWACL`:
+
+| `API_NAME` | `EXT_IP` | Note |
+|-----------|---------|------|
+| `TEAMS_IN_HANDLER` | `13.66.140.x` | APIM SEA egress IP |
+| `TEAMS_IN_HANDLER` | `127.0.0.1` | Localhost / Postman (DEV only) |
+
+Get exact APIM IPs from: **Azure Portal → APIM instance → Overview → Public IP addresses**.
+
+### Step 4 — Class ZCL_VND_JSON_TO_ABAP (SE24)
+
+`SE24 → Create → ZCL_VND_JSON_TO_ABAP`
+
+| Setting | Value |
+|---------|-------|
+| Instantiation | Public |
+| Final | Yes |
+
+**Attributes:** `MV_JSON` Private Instance TYPE STRING
+
+**Methods:**
+
+| Method | Visibility | Note |
+|--------|-----------|------|
+| `CONSTRUCTOR` | Public | `IV_JSON TYPE STRING` importing |
+| `JSON_TO_ABAP` | Public | `IV_JSON TYPE STRING` + `CHANGING CS_DATA TYPE ANY` |
+| `PARSE` | Public | `CHANGING CS_DATA TYPE ANY` |
+| `STRIP_QUOTES` | Private | `IV_INPUT → RV_OUTPUT TYPE STRING` |
+| `UNESCAPE` | Private | `IV_INPUT → RV_OUTPUT TYPE STRING` |
+
+Copy method bodies from the ZIP files exactly as-is. **Activate.**
+
+### Step 5 — Class ZCL_BASE_HTTP (SE24)
+
+`SE24 → Create → ZCL_BASE_HTTP`
+
+Three public instance methods:
+
+| Method | Key Parameters |
+|--------|---------------|
+| `M_CHECK_IP_AUTH` | Import: `I_IP TYPE RFCIPV6ADDR`, `I_CLASS_NAME TYPE REPID` · Export: `E_ERROR TYPE CHAR1` |
+| `M_ITAB_TO_JSON` | Export any flat structure → `JSON TYPE STRING` |
+| `M_SET_RESPONSE` | Wraps `server->response->set_cdata` + status code |
+
+`M_CHECK_IP_AUTH` queries `ZAPIGWACL`:
+```abap
+SELECT SINGLE * FROM zapigwacl
+  WHERE api_name = i_class_name
+    AND ext_ip   = i_ip.
+IF sy-subrc <> 0. e_error = 'X'. ENDIF.
+```
+
+**Activate.**
+
+### Step 6 — Class TEAMS_IN_HANDLER (SE24)
+
+`SE24 → Create → TEAMS_IN_HANDLER`
+
+| Setting | Value |
+|---------|-------|
+| Interface | `IF_HTTP_EXTENSION` |
+| Instantiation | Public |
+
+**Inner types (Types tab):**
+```abap
+TYPES: BEGIN OF ty_appr_line,
+         aufnr TYPE aufnr,
+         werks TYPE werks_d,
+         maktx TYPE maktx,
+         bdmng TYPE bdmng,
+         meins TYPE meins,
+       END OF ty_appr_line,
+       tt_appr_line TYPE STANDARD TABLE OF ty_appr_line WITH DEFAULT KEY.
+```
+
+**Methods:**
+
+| Method | Visibility | Description |
+|--------|-----------|-------------|
+| `IF_HTTP_EXTENSION~HANDLE_REQUEST` | Public | ICF inbound callback |
+| `SEND_APPROVAL` | Public | Outbound POST to Power Automate |
+| `UPDATE_APPROVAL_STATUS` | Private | Write decision to ZTWO_APPR_TMS + ZTWOAPPR |
+| `CHECK_AND_RELEASE` | Private | BAPI release after all RESB lines approved |
+
+Copy full method bodies from `ENHANCEMENT2_IMPLEMENTATION_GUIDE.md` Step 6.
+**Activate.**
+
+### Step 7 — FM Z_WO_APPR_TEAMS_SEND (SE80 / SE37)
+
+> **No new Function Group.** Add the FM directly to the existing `ZFG_WO_APPROVAL`.
+
+`SE80 → ZFG_WO_APPROVAL → Function Modules → right-click → Create`
+
+| Field | Value |
+|-------|-------|
+| Function module | `Z_WO_APPR_TEAMS_SEND` |
+| Function group | `ZFG_WO_APPROVAL` |
+
+**Import parameters:**
+
+| Parameter | Type | Default |
+|-----------|------|---------|
+| `IV_AUFNR` | `AUFNR` | |
+| `IV_REQUESTOR` | `SYUNAME` | `SY-UNAME` |
+| `IV_APPR_LEVEL` | `CHAR4` | `'LVL3'` |
+
+**Tables:** `IT_ITEMS TYPE TEAMS_IN_HANDLER=>TT_APPR_LINE`
+
+**Export:** `EV_REQ_ID TYPE CHAR32`, `EV_HTTP_CODE TYPE I`
+
+**Exceptions:** `HTTP_ERROR`, `PAYLOAD_EMPTY`
+
+Body: instantiates `TEAMS_IN_HANDLER` and calls `send_approval`.
+**Activate the FM and the Function Group.**
+
+### Step 8 — SICF Service (SICF)
+
+`SICF → default_host → sap → bc → right-click → New Sub-Element`
+
+1. Create node `zwo_appr_teams` under `bc`
+2. Create child node `callback` under `zwo_appr_teams`
+3. **Handler List** tab of `callback` → add: `TEAMS_IN_HANDLER`
+4. **Logon Data** tab → Logon procedure: Basic · Service user: `TEAMS_API`
+5. Right-click `callback` → **Activate**
+
+Result URL:
+```
+https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+```
+
+**Service user `TEAMS_API` (PFCG role `Z_WO_APPR_API`):**
+
+| Auth object | Field | Value |
+|-------------|-------|-------|
+| `S_ICF` | `ICF_VALUE` | `/sap/bc/zwo_appr_teams/callback` |
+| `S_RFC` | `RFC_NAME` | `ZFG_WO_APPROVAL` |
+| `S_RFC` | `RFC_TYPE` | `FUGR` |
+
+No `SAP_ALL`. No `S_TCODE`.
+
+### Step 9 — TVARVC entries (STVARV)
+
+`SM30 → TVARVC` or transaction `STVARV`:
+
+| Name | Type | Value |
+|------|------|-------|
+| `Z_WO_APPR_APIM_URL` | `P` | `https://<apim-host>/wo-approval/teams-trigger` |
+| `Z_WO_APPR_APIM_KEY` | `P` | `<APIM subscription key>` |
+
+### Step 10 — Hook into Screen 0300
+
+**10.1 GUI Status ZSTAT_0300 (SE41)**
+
+Add button after `&RAPR`:
+
+| Function code | Icon / Text | F-Key |
+|:---:|------|:---:|
+| `&RTMS` | Remind via Teams | Shift+F7 |
+
+**10.2 PAI module USER_COMMAND_0300**
+File: `2. Function_Group/3. PAI Modules/USER_COMMAND_0300.abap`
+
+Inside `CASE save_ok` add before `WHEN '&BACK'`:
+```abap
+WHEN '&RTMS'.
+  PERFORM remind_items_via_teams.
+```
+
+**10.3 FORM remind_items_via_teams**
+File: `2. Function_Group/7. includes/LZFG_WO_APPROVALF01.abap`
+
+Add at the end of the file (already included in this repo — see the file).
+
+The FORM:
+1. Collects marked Table Control rows into `lt_items`
+2. Reads `ZTWOAPPR.APPROVAL_LVL3` to determine `lv_appr_level`
+3. Calls `Z_WO_APPR_TEAMS_SEND`
+4. Shows success/error status message
+
+### Step 11 — Test with Postman
+
+**Pre-condition:** insert a SENT row in `ZTWO_APPR_TMS` via SE16.
+
+**Test — SDH approval (LVL3):**
+```json
+POST /sap/bc/zwo_appr_teams/callback?sap-client=<client>
+{
+  "request_id": "UTX-20260514083045-A1B2C3",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL3",
+  "decision":   "APPROVED",
+  "approver":   "demakb@unitedtractors.com",
+  "comments":   "OK",
+  "timestamp":  "2026-05-18T10:30:00Z"
+}
+```
+Expected: `{"msgty":"S","message":"APPROVED processed successfully"}`
+Check: `ZTWOAPPR.APPROVAL_LVL3 = 'X'`, `APPR_BY_LVL3 = demakb@...`
+
+**Test — HO ADM approval (LVL1):**
+```json
+{
+  "request_id": "UTX-20260514090000-B3C4D5",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL1",
+  "decision":   "APPROVED",
+  "approver":   "viandraf@unitedtractors.com",
+  "comments":   "Approved",
+  "timestamp":  "2026-05-18T09:00:00Z"
+}
+```
+Check: `ZTWOAPPR.APPROVAL_LVL1 = 'X'`, `APPR_BY_LVL1 = viandraf@...`
+
+If all RESB lines for AUFNR `0000004711` are now approved, the WO will be
+auto-released and the response will be:
+`{"msgty":"S","message":"APPROVED — Work Order released"}`
+
+---
+
+## 7. Objects Built
+
+| Object | Type | Transaction | Action |
+|--------|------|-------------|--------|
+| `ZTWO_APPR_TMS` | Table | SE11 | **Create** |
+| `ZAPIGWACL` | Table rows | SM30 | **Add APIM IP rows** (table exists) |
+| `ZCL_VND_JSON_TO_ABAP` | Class | SE24 | **Create** from ZIP |
+| `ZCL_BASE_HTTP` | Class | SE24 | **Create** |
+| `TEAMS_IN_HANDLER` | Class | SE24 | **Create** (inbound + outbound) |
+| `ZFG_WO_APPROVAL` | Function Group | SE80 | **Existing** — no new FG |
+| `Z_WO_APPR_TEAMS_SEND` | Function Module | SE37 | **Create** inside `ZFG_WO_APPROVAL` |
+| `/sap/bc/zwo_appr_teams/callback` | SICF service | SICF | **Create + activate** |
+| `Z_WO_APPR_APIM_URL` | TVARVC entry | STVARV | **Maintain** |
+| `Z_WO_APPR_APIM_KEY` | TVARVC entry | STVARV | **Maintain** |
+| `Z_WO_APPR_API` | Role | PFCG | **Create** — assign to `TEAMS_API` |
+
+---
+
+## 8. Screen 0300 Changes
+
+| File | Change |
+|------|--------|
+| `2. Function_Group/3. PAI Modules/USER_COMMAND_0300.abap` | Added `WHEN '&RTMS'. PERFORM remind_items_via_teams.` |
+| `2. Function_Group/7. includes/LZFG_WO_APPROVALF01.abap` | Added `FORM remind_items_via_teams` at end |
+| `2. Function_Group/5. GUI Status/ZSTAT_0300.abap` | Add button `&RTMS` / Shift+F7 (SE41) |
+
+---
+
+## 9. Quick Setup Checklist
 
 - [ ] Create table `ZTWO_APPR_TMS` (SE11)
 - [ ] Create class `ZCL_VND_JSON_TO_ABAP` from ZIP (SE24)
 - [ ] Create class `ZCL_BASE_HTTP` (SE24)
 - [ ] Create class `TEAMS_IN_HANDLER` (SE24)
-- [ ] Create FM `Z_WO_APPR_TEAMS_SEND` inside `ZFG_WO_APPROVAL` (SE80/SE37)
+- [ ] Create FM `Z_WO_APPR_TEAMS_SEND` inside **existing** `ZFG_WO_APPROVAL` (SE80)
 - [ ] Create SICF service `/sap/bc/zwo_appr_teams/callback` (SICF)
 - [ ] Maintain `Z_WO_APPR_APIM_URL` + `Z_WO_APPR_APIM_KEY` in TVARVC (STVARV)
-- [ ] Add APIM egress IPs to `ZAPIGWACL` (SM30)
+- [ ] Add APIM egress IPs to `ZAPIGWACL` for `TEAMS_IN_HANDLER` (SM30)
 - [ ] Add `&RTMS` button to `ZSTAT_0300` (SE41)
-- [ ] Test with Postman (see guide Step 11)
+- [ ] Verify `USER_COMMAND_0300.abap` has `WHEN '&RTMS'`
+- [ ] Verify `LZFG_WO_APPROVALF01.abap` has `FORM remind_items_via_teams`
+- [ ] Assign role `Z_WO_APPR_API` to service user `TEAMS_API` (SU01/PFCG)
+- [ ] Test callback with Postman (LVL3 → LVL1 → verify ZTWOAPPR flags)

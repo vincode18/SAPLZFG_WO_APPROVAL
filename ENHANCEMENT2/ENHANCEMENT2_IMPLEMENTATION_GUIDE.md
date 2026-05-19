@@ -752,24 +752,71 @@ CLASS teams_in_handler IMPLEMENTATION.
 
 *----------------------------------------------------------------------*
 * PRIVATE — CHECK_AND_RELEASE
-* If every ZTWO_APPR_TMS row for this WO has APPR_VALID='X', release WO
+* Reads every non-deleted RESB component for the WO and cross-checks
+* ZTWOAPPR.  Release is triggered only when EVERY line has
+* approval_lvl1 = 'X'  OR  approval_lvl3 = 'X'  — matching the same
+* appr_flag derivation used by the rest of ZFG_WO_APPROVAL.
 *----------------------------------------------------------------------*
   METHOD check_and_release.
 
-    DATA: lv_total TYPE i,
-          lv_done  TYPE i.
+    " ── Step 1: Load active RESB components for this WO ─────────────────
+    TYPES: BEGIN OF ty_resb_key,
+             aufnr TYPE aufnr,
+             matnr TYPE matnr,
+             rspos TYPE rspos,   " = change_id in ZTWOAPPR
+           END OF ty_resb_key.
 
-    SELECT COUNT(*) FROM ztwo_appr_tms
-      WHERE aufnr = @iv_aufnr INTO @lv_total.
+    DATA lt_resb TYPE STANDARD TABLE OF ty_resb_key.
 
-    SELECT COUNT(*) FROM ztwo_appr_tms
-      WHERE aufnr = @iv_aufnr AND appr_valid = 'X' INTO @lv_done.
+    SELECT aufnr, matnr, rspos
+      FROM resb
+      INTO TABLE @lt_resb
+      WHERE aufnr = @iv_aufnr
+        AND xloek = @space.        " exclude deletion-flagged lines
 
-    " Only release when ALL rows are approved
-    IF lv_total = 0 OR lv_total <> lv_done.
-      RETURN.
+    IF lt_resb IS INITIAL.
+      RETURN.                      " no components → nothing to check
     ENDIF.
 
+    " ── Step 2: Load ZTWOAPPR approval flags for this WO ─────────────────
+    TYPES: BEGIN OF ty_appr,
+             matnr        TYPE matnr,
+             change_id    TYPE char10,
+             approval_lvl1 TYPE char1,
+             approval_lvl3 TYPE char1,
+           END OF ty_appr.
+
+    DATA lt_appr TYPE STANDARD TABLE OF ty_appr.
+
+    SELECT matnr, change_id, approval_lvl1, approval_lvl3
+      FROM ztwoappr
+      INTO TABLE @lt_appr
+      WHERE aufnr = @iv_aufnr.
+
+    " ── Step 3: Verify every RESB line has an approval flag ──────────────
+    " Mirror the existing appr_flag rule:  lvl1='X' OR lvl3='X'  → approved
+    LOOP AT lt_resb ASSIGNING FIELD-SYMBOL(<resb>).
+
+      " Primary: exact key  aufnr + matnr + change_id(=rspos)
+      READ TABLE lt_appr ASSIGNING FIELD-SYMBOL(<appr>)
+        WITH KEY matnr     = <resb>-matnr
+                 change_id = <resb>-rspos.
+
+      IF sy-subrc <> 0.
+        " Fallback: any ZTWOAPPR row for this matnr that carries a flag
+        READ TABLE lt_appr ASSIGNING <appr>
+          WITH KEY matnr = <resb>-matnr.
+      ENDIF.
+
+      " If still not found, or neither level is approved → do not release
+      IF sy-subrc <> 0
+      OR ( <appr>-approval_lvl1 <> 'X' AND <appr>-approval_lvl3 <> 'X' ).
+        RETURN.
+      ENDIF.
+
+    ENDLOOP.
+
+    " ── Step 4: All RESB lines approved — release the Work Order ─────────
     DATA: lt_return  TYPE STANDARD TABLE OF bapiret2,
           lt_methods TYPE STANDARD TABLE OF bapi_alm_order_method,
           lt_header  TYPE STANDARD TABLE OF bapi_alm_order_headers_i.
