@@ -61,6 +61,8 @@ MODULE user_command_0300 INPUT.
       PERFORM reset_approval_items.
     WHEN 'SAVE'.                          " from Host 0300 BT_SAVE
       PERFORM save_approval.
+    WHEN '&RTMS'.
+      PERFORM remind_items_via_teams.
     WHEN '&BACK'.
       PERFORM unlock_wo.
       CLEAR gv_open_from_pending.
