@@ -28,18 +28,22 @@
 ## Table of Contents
 
 1. [Architecture Overview](#1-architecture-overview)
-2. [Step 1 — Package](#2-step-1--package)
-3. [Step 2 — Table ZTWO_APPR_TMS](#3-step-2--table-ztwo_appr_tms)
-4. [Step 3 — IP Whitelist: existing table ZAPIGWACL](#4-step-3--ip-whitelist-existing-table-zapigwacl)
-5. [Step 4 — Class ZCL_VND_JSON_TO_ABAP (from ZIP)](#5-step-4--class-zcl_vnd_json_to_abap-from-zip)
-6. [Step 5 — Class ZCL_BASE_HTTP](#6-step-5--class-zcl_base_http)
-7. [Step 6 — Class TEAMS_IN_HANDLER (single main class)](#7-step-6--class-teams_in_handler-single-main-class)
-8. [Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)](#8-step-7--fm-z_wo_appr_teams_send-add-to-existing-zfg_wo_approval)
-9. [Step 8 — SICF Service](#9-step-8--sicf-service)
-10. [Step 9 — TVARVC + ZAPIGWACL entries](#10-step-9--tvarvc--zapigwacl-entries)
-11. [Step 10 — Hook into Screen 0300](#11-step-10--hook-into-screen-0300)
-12. [Step 11 — Test with Postman](#12-step-11--test-with-postman)
-13. [Object Summary](#13-object-summary)
+2. [Approval Logic](#2-approval-logic)
+3. [Sending Data Logic (SAP → Teams)](#3-sending-data-logic-sap--teams)
+4. [Receiving Data from Teams (Teams → SAP)](#4-receiving-data-from-teams-teams--sap)
+5. [Auto-Release Logic (check_and_release)](#5-auto-release-logic-check_and_release)
+6. [Step 1 — Package](#6-step-1--package)
+7. [Step 2 — Table ZTWO_APPR_TMS](#7-step-2--table-ztwo_appr_tms)
+8. [Step 3 — IP Whitelist: existing table ZAPIGWACL](#8-step-3--ip-whitelist-existing-table-zapigwacl)
+9. [Step 4 — Class ZCL_VND_JSON_TO_ABAP (from ZIP)](#9-step-4--class-zcl_vnd_json_to_abap-from-zip)
+10. [Step 5 — Class ZCL_BASE_HTTP](#10-step-5--class-zcl_base_http)
+11. [Step 6 — Class TEAMS_IN_HANDLER (single main class)](#11-step-6--class-teams_in_handler-single-main-class)
+12. [Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)](#12-step-7--fm-z_wo_appr_teams_send-add-to-existing-zfg_wo_approval)
+13. [Step 8 — SICF Service](#13-step-8--sicf-service)
+14. [Step 9 — TVARVC + ZAPIGWACL entries](#14-step-9--tvarvc--zapigwacl-entries)
+15. [Step 10 — Hook into Screen 0300](#15-step-10--hook-into-screen-0300)
+16. [Step 11 — Test with Postman](#16-step-11--test-with-postman)
+17. [Object Summary](#17-object-summary)
 
 ---
 
@@ -81,8 +85,9 @@ FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
 {
   "request_id": "UTX-20260514083045-A1B2C3",
   "aufnr":      "0000004711",
+  "appr_level": "LVL3",
   "decision":   "APPROVED",
-  "approver":   "alice@unitedtractors.com",
+  "approver":   "demakb@unitedtractors.com",
   "comments":   "OK, approved",
   "timestamp":  "2026-05-18T10:30:00Z"
 }
@@ -90,7 +95,262 @@ FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
 
 ---
 
-## 2. Step 1 — Package
+## 2. Approval Logic
+
+### 2.1 Approval Levels
+
+| Level | Actor | Table column set | Trigger |
+|-------|-------|-----------------|---------|
+| `LVL3` | SDH Branch Plant | `ZTWOAPPR.APPROVAL_LVL3 = 'X'` | Workers/Branch sends to SDH |
+| `LVL1` | HO ADM | `ZTWOAPPR.APPROVAL_LVL1 = 'X'` | After SDH approves, escalate to HO |
+
+The system selects the level automatically in `FORM remind_items_via_teams`:
+
+```abap
+SELECT SINGLE approval_lvl3 FROM ztwoappr
+  INTO @lv_lvl3_done WHERE aufnr = @gv_aufnr.
+
+lv_appr_level = COND #( WHEN lv_lvl3_done = 'X'
+                         THEN 'LVL1'    " LVL3 done → send to HO ADM
+                         ELSE 'LVL3' ). " default: send to SDH first
+```
+
+### 2.2 appr_flag Rule (matches existing ZFG_WO_APPROVAL logic)
+
+```
+appr_flag = 'X'  when  ZTWOAPPR.APPROVAL_LVL1 = 'X'
+                    OR  ZTWOAPPR.APPROVAL_LVL3 = 'X'
+```
+
+Both the on-screen display and `check_and_release` use this exact rule.
+
+### 2.3 cmpPlantApproverMap (in Power Automate)
+
+Power Automate uses `appr_level` to look up the approver email:
+
+```json
+{
+  "JKT": "viandraf@unitedtractors.com",
+  "JBI": "demakb@unitedtractors.com",
+  "TBG": "ArisA@unitedtractors.com",
+  "ADM": "viandraf@unitedtractors.com"
+}
+```
+
+- `LVL3` → key = `werks` (e.g. `"JKT"`) → SDH email for that plant
+- `LVL1` → key = `"ADM"` → HO ADM email regardless of plant
+
+### 2.4 Approval State in ZTWOAPPR
+
+| APPROVAL_LVL3 | APPROVAL_LVL1 | Meaning |
+|:---:|:---:|---------|
+| ` ` | ` ` | No approval yet |
+| `X` | ` ` | SDH approved, waiting for HO ADM |
+| ` ` | `X` | HO ADM approved directly (L1/L5 path) |
+| `X` | `X` | Fully approved at both levels |
+
+---
+
+## 3. Sending Data Logic (SAP → Teams)
+
+### 3.1 Trigger
+
+Helpdesk user marks items in the Table Control on Screen 0300 and clicks
+**Remind via Teams** (function code `&RTMS`, Shift+F7).
+
+### 3.2 Call Chain
+
+```
+&RTMS
+  └─ USER_COMMAND_0300 WHEN '&RTMS'
+       └─ PERFORM remind_items_via_teams     [LZFG_WO_APPROVALF01]
+            ├─ BUILD lt_items from gt_items_tc WHERE mark = 'X'
+            ├─ SELECT ZTWOAPPR → determine lv_appr_level
+            └─ CALL FUNCTION 'Z_WO_APPR_TEAMS_SEND'
+                 └─ TEAMS_IN_HANDLER->send_approval( )
+```
+
+### 3.3 Request ID Format
+
+```
+UTX-20260514083045-A1B2C3
+│    │              └── First 6 chars of CL_SYSTEM_UUID C32
+│    └── YYYYMMDDHHMMSS  (sy-datum + sy-uzeit)
+└── sy-sysid
+```
+
+Generated by:
+```abap
+DATA(lv_uuid) = cl_system_uuid=>create_uuid_c32_static( ).
+ev_req_id = |{ sy-sysid }-{ sy-datum }{ sy-uzeit }-{ lv_uuid+0(6) }|.
+```
+
+### 3.4 JSON Payload Sent to Power Automate
+
+```json
+{
+  "request_id": "UTX-20260514083045-A1B2C3",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL3",
+  "requestor":  "JOHN",
+  "items": [
+    { "werks": "JKT", "maktx": "BEARING 6205", "bdmng": "2", "meins": "PC" },
+    { "werks": "JKT", "maktx": "SEAL KIT",     "bdmng": "1", "meins": "ST" }
+  ]
+}
+```
+
+- `appr_level` tells Power Automate which key to use in `cmpPlantApproverMap`
+- `items[]` is built from marked rows in the Table Control (`gt_items_tc`)
+
+### 3.5 TVARVC Configuration
+
+| Entry name | Type | Content |
+|-----------|------|---------|
+| `Z_WO_APPR_APIM_URL` | `P` | Full Power Automate / APIM endpoint URL |
+| `Z_WO_APPR_APIM_KEY` | `P` | Azure APIM subscription key |
+
+### 3.6 ZTWO_APPR_TMS INSERT (tracking)
+
+One row is inserted per item per send:
+
+| Field | Value |
+|-------|-------|
+| `AUFNR` | Work Order number |
+| `TEAMS_REQ_ID` | Generated `request_id` |
+| `TEAMS_STATUS` | `SENT` |
+| `APPR_LEVEL` | `LVL1` or `LVL3` |
+| `WERKS` | Plant of the item |
+| `SENT_BY` | `sy-uname` |
+| `SENT_AT` | Current timestamp |
+
+---
+
+## 4. Receiving Data from Teams (Teams → SAP)
+
+### 4.1 Endpoint
+
+```
+POST https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+Authorization: Basic <TEAMS_API user>
+Content-Type: application/json
+```
+
+Bound to `TEAMS_IN_HANDLER` via SICF service `/sap/bc/zwo_appr_teams/callback`.
+
+### 4.2 Callback JSON (Power Automate → SAP)
+
+```json
+{
+  "request_id": "UTX-20260514083045-A1B2C3",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL3",
+  "decision":   "APPROVED",
+  "approver":   "demakb@unitedtractors.com",
+  "comments":   "OK",
+  "timestamp":  "2026-05-18T10:30:00Z"
+}
+```
+
+`decision` accepted values: `APPROVED` · `REJECTED` · `TIMEOUT`
+
+### 4.3 7-Phase Processing in HANDLE_REQUEST
+
+```
+Phase 1 — Read body           server->request->get_cdata()    ← MUST be first
+Phase 2 — IP authorization    ZAPIGWACL: API_NAME=TEAMS_IN_HANDLER, EXT_IP=exact
+Phase 3 — Validate not empty  lv_request IS INITIAL → 400
+Phase 4 — Parse JSON          ZCL_VND_JSON_TO_ABAP->json_to_abap()
+Phase 5 — Validate fields     aufnr + decision required; appr_level default LVL3
+Phase 6 — Business logic      update_approval_status() + check_and_release()
+Phase 7 — JSON response       {"msgty":"S","message":"..."}
+```
+
+### 4.4 update_approval_status — What Gets Written
+
+On `decision = 'APPROVED'`:
+
+**ZTWO_APPR_TMS** (Teams tracking):
+```
+APPR_VALID   = 'X'
+TEAMS_STATUS = 'APPROVED'
+APPR_USER    = <approver email>
+APPR_DATE    = sy-datum
+APPR_TIME    = sy-uzeit
+LAST_UPDATED = current timestamp
+WHERE aufnr = iv_aufnr AND teams_req_id = iv_req_id
+```
+
+**ZTWOAPPR** (main approval table — stamped by level):
+
+| `appr_level` | Fields updated |
+|-------------|---------------|
+| `LVL3` | `APPROVAL_LVL3='X'`, `APPR_BY_LVL3`, `APPR_DATE_LVL3`, `APPR_TIME_LVL3` |
+| `LVL1` | `APPROVAL_LVL1='X'`, `APPR_BY_LVL1`, `APPR_DATE_LVL1`, `APPR_TIME_LVL1` |
+
+On `decision = 'REJECTED'` or `'TIMEOUT'`: only ZTWO_APPR_TMS is updated (`APPR_VALID = 'R'`); ZTWOAPPR flags are left unchanged.
+
+### 4.5 IP Whitelist (ZAPIGWACL)
+
+```abap
+SELECT SINGLE * FROM zapigwacl
+  WHERE api_name = 'TEAMS_IN_HANDLER'
+    AND ext_ip   = <caller IP>.        " exact match — no ranges
+```
+
+---
+
+## 5. Auto-Release Logic (check_and_release)
+
+Called automatically after every `APPROVED` callback. Releases the WO only
+when **every active RESB component line** carries an approval flag.
+
+### 5.1 Why RESB, not ZTWO_APPR_TMS
+
+`ZTWO_APPR_TMS` tracks Teams *requests* (one row per send), not components.
+The authoritative list of what must be approved is **RESB** — the WO component
+reservation table — joined against **ZTWOAPPR** where the approval flags live.
+
+### 5.2 Logic
+
+```
+1. SELECT RESB WHERE aufnr = iv_aufnr AND xloek = space
+   → lt_resb  (active, non-deleted components)
+
+2. SELECT ZTWOAPPR WHERE aufnr = iv_aufnr
+   → lt_appr  (approval flags per matnr / change_id)
+
+3. LOOP AT lt_resb:
+     READ lt_appr WITH KEY matnr = <resb>-matnr
+                           change_id = <resb>-rspos   ← rspos maps to change_id
+     FALLBACK: READ lt_appr WITH KEY matnr only
+
+     IF not found  OR  (approval_lvl1 ≠ 'X' AND approval_lvl3 ≠ 'X')
+       RETURN  ← not all approved, skip release
+
+4. All lines passed → BAPI_ALM_ORDER_MAINTAIN RELEASE + SAVE
+   BAPI_TRANSACTION_COMMIT wait = 'X'
+   ev_released = 'X'
+```
+
+### 5.3 Approval Rule (matches existing appr_flag derivation)
+
+```abap
+IF <appr>-approval_lvl1 <> 'X' AND <appr>-approval_lvl3 <> 'X'.
+  RETURN.  " this line not yet approved
+ENDIF.
+```
+
+Consistent with `LZFG_WO_APPROVALF03`:
+```abap
+IF ls_item-l1_approved = 'X' OR ls_item-l3_approved = 'X'.
+  ls_item-appr_flag = 'X'.
+ENDIF.
+```
+
+---
+
+## 6. Step 1 — Package
 
 **Transaction: SE21**
 
@@ -102,7 +362,7 @@ FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
 
 ---
 
-## 3. Step 2 — Table ZTWO_APPR_TMS
+## 7. Step 2 — Table ZTWO_APPR_TMS
 
 **Transaction: SE11 → Database table → Create**
 
@@ -136,7 +396,7 @@ Activate.
 
 ---
 
-## 4. Step 3 — IP Whitelist: existing table ZAPIGWACL
+## 8. Step 3 — IP Whitelist: existing table ZAPIGWACL
 
 > **No new table needed.** `ZCL_BASE_HTTP->m_check_ip_auth` queries
 > `ZAPIGWACL` — the same table and the same logic you already use in
@@ -159,7 +419,7 @@ You will populate the actual IP rows in **Step 9**.
 
 ---
 
-## 5. Step 4 — Class ZCL_VND_JSON_TO_ABAP (from ZIP)
+## 9. Step 4 — Class ZCL_VND_JSON_TO_ABAP (from ZIP)
 
 **Transaction: SE24 → Create class**
 
@@ -249,7 +509,7 @@ lo_json->json_to_abap(
 
 ---
 
-## 6. Step 5 — Class ZCL_BASE_HTTP
+## 10. Step 5 — Class ZCL_BASE_HTTP
 
 **Transaction: SE24 → Create class**
 
@@ -337,7 +597,7 @@ Activate.
 
 ---
 
-## 7. Step 6 — Class TEAMS_IN_HANDLER (single main class)
+## 11. Step 6 — Class TEAMS_IN_HANDLER (single main class)
 
 **Transaction: SE24 → Create class**
 
@@ -857,7 +1117,7 @@ Activate. Resolve any syntax errors before moving on.
 
 ---
 
-## 8. Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)
+## 12. Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)
 
 **Transaction: SE80**
 
@@ -958,7 +1218,7 @@ Activate the FM and the Function Group.
 
 ---
 
-## 9. Step 8 — SICF Service
+## 13. Step 8 — SICF Service
 
 **Transaction: SICF**
 
@@ -1002,7 +1262,7 @@ No `SAP_ALL`. No `S_TCODE`.
 
 ---
 
-## 10. Step 9 — TVARVC + ZAPIGWACL entries
+## 14. Step 9 — TVARVC + ZAPIGWACL entries
 
 ### 10.1 TVARVC (transaction STVARV)
 
@@ -1028,7 +1288,7 @@ No `SAP_ALL`. No `S_TCODE`.
 
 ---
 
-## 11. Step 10 — Hook into Screen 0300
+## 15. Step 10 — Hook into Screen 0300
 
 ### 11.1 GUI Status ZSTAT_0300 (SE41)
 
@@ -1126,7 +1386,7 @@ Activate include + PAI module.
 
 ---
 
-## 12. Step 11 — Test with Postman
+## 16. Step 11 — Test with Postman
 
 ### 12.1 Insert a SENT row in ZTWO_APPR_TMS first (SE16)
 
@@ -1200,7 +1460,7 @@ Expected: `{"msgty":"E","message":"Missing required fields: aufnr or decision"}`
 
 ---
 
-## 13. Object Summary
+## 17. Object Summary
 
 | Object | Transaction | Type | Action |
 |--------|-------------|------|--------|
