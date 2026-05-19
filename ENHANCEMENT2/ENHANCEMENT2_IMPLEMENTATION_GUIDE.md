@@ -117,6 +117,7 @@ One row per Teams request (INSERT on SEND, UPDATE on APPROVED / REJECTED / TIMEO
 | `TEAMS_REQ_ID` | ✔ | `CHAR32` | Power Automate run-id (correlation) |
 | `APPR_VALID` | | `CHAR1` | `X`=Approved · `R`=Rejected · ` `=Open |
 | `TEAMS_STATUS` | | `CHAR10` | `SENT` · `APPROVED` · `REJECTED` · `TIMEOUT` |
+| `APPR_LEVEL` | | `CHAR4` | `LVL1`=HO ADM · `LVL3`=SDH Branch Plant |
 | `WERKS` | | `WERKS_D` | Plant |
 | `APPR_USER` | | `SYUNAME` | Who approved/rejected in Teams |
 | `APPR_DATE` | | `DATS` | Date of decision |
@@ -399,10 +400,18 @@ TYPES: BEGIN OF ty_appr_line,
 | Import | `IT_ITEMS` | `TEAMS_IN_HANDLER=>TT_APPR_LINE` | Selected TC rows |
 | Import | `IV_AUFNR` | `AUFNR` | Work Order |
 | Import | `IV_REQUESTOR` | `SYUNAME` | Helpdesk user |
+| Import | `IV_APPR_LEVEL` | `CHAR4` | `LVL1`=HO ADM · `LVL3`=SDH Branch |
 | Export | `EV_REQ_ID` | `CHAR32` | Generated correlation id |
 | Export | `EV_HTTP_CODE` | `I` | HTTP response code from Flow |
 | Export | `EV_ERROR` | `CHAR1` | `X` = failed |
 | Export | `EV_MESSAGE` | `STRING` | Error description |
+
+> **Level routing logic:**
+> - `LVL3` → SDH Branch Plant approves items in Teams (workers → SDH)
+> - `LVL1` → HO ADM approves in Teams (Branch L4 → HO, using `"ADM"` key in `cmpPlantApproverMap`)
+>
+> Power Automate uses `appr_level` to pick the right approver from `cmpPlantApproverMap`.
+> When Teams callback arrives, SAP writes the flag to the matching column in `ZTWOAPPR`.
 
 **UPDATE_APPROVAL_STATUS**
 
@@ -412,6 +421,7 @@ TYPES: BEGIN OF ty_appr_line,
 | Import | `IV_REQ_ID` | `CHAR32` |
 | Import | `IV_DECISION` | `CHAR10` |
 | Import | `IV_APPROVER` | `STRING` |
+| Import | `IV_APPR_LEVEL` | `CHAR4` | `LVL1` or `LVL3` |
 | Export | `EV_ERROR` | `CHAR1` |
 | Export | `EV_MESSAGE` | `STRING` |
 
@@ -445,14 +455,15 @@ CLASS teams_in_handler IMPLEMENTATION.
             message TYPE string,
           END OF lw_message.
 
-    " JSON payload — field names must match what Power Automate sends
+    " JSON payload — field names must match what Power Automate sends back
     DATA: BEGIN OF ls_data,
-            request_id TYPE string,
-            aufnr      TYPE string,
-            decision   TYPE string,
-            approver   TYPE string,
-            comments   TYPE string,
-            timestamp  TYPE string,
+            request_id  TYPE string,
+            aufnr       TYPE string,
+            appr_level  TYPE string,   " LVL1=HO ADM, LVL3=SDH Branch
+            decision    TYPE string,
+            approver    TYPE string,
+            comments    TYPE string,
+            timestamp   TYPE string,
           END OF ls_data.
 
     " Allow other ICF extensions in the chain
@@ -510,7 +521,15 @@ CLASS teams_in_handler IMPLEMENTATION.
       IF ls_data-aufnr IS INITIAL OR ls_data-decision IS INITIAL.
         lv_error = 'X'.
         lw_message-msgty   = 'E'.
-        lw_message-message = 'Missing required fields: aufnr or status'.
+        lw_message-message = 'Missing required fields: aufnr or decision'.
+      ENDIF.
+    ENDIF.
+
+    IF lv_error IS INITIAL.
+      TRANSLATE ls_data-appr_level TO UPPER CASE.
+      IF ls_data-appr_level <> 'LVL1' AND ls_data-appr_level <> 'LVL3'.
+        " Default to LVL3 (SDH) when field is absent / legacy flow
+        ls_data-appr_level = 'LVL3'.
       ENDIF.
     ENDIF.
 
@@ -527,14 +546,15 @@ CLASS teams_in_handler IMPLEMENTATION.
       OR ls_data-decision = 'REJECTED'
       OR ls_data-decision = 'TIMEOUT'.
 
-        " Write decision to ZTWO_APPR_TMS
+        " Write decision to ZTWO_APPR_TMS and stamp ZTWOAPPR by appr_level
         update_approval_status(
-          EXPORTING iv_aufnr    = CONV #( ls_data-aufnr )
-                    iv_req_id   = CONV #( ls_data-request_id )
-                    iv_decision = ls_data-decision
-                    iv_approver = ls_data-approver
-          IMPORTING ev_error    = lv_ev_err
-                    ev_message  = lv_ev_msg ).
+          EXPORTING iv_aufnr     = CONV #( ls_data-aufnr )
+                    iv_req_id    = CONV #( ls_data-request_id )
+                    iv_decision  = ls_data-decision
+                    iv_approver  = ls_data-approver
+                    iv_appr_level = CONV #( ls_data-appr_level )
+          IMPORTING ev_error     = lv_ev_err
+                    ev_message   = lv_ev_msg ).
 
         IF lv_ev_err = 'X'.
           lv_error = 'X'.
@@ -608,8 +628,11 @@ CLASS teams_in_handler IMPLEMENTATION.
     DATA(lv_uuid) = cl_system_uuid=>create_uuid_c32_static( ).
     ev_req_id = |{ sy-sysid }-{ sy-datum }{ sy-uzeit }-{ lv_uuid+0(6) }|.
 
-    " Build JSON payload
+    " Build JSON payload — appr_level tells Power Automate which approver to pick:
+    "   LVL3 → cmpPlantApproverMap[werks]  (SDH Branch Plant)
+    "   LVL1 → cmpPlantApproverMap['ADM']  (HO ADM: viandraf@unitedtractors.com)
     lv_body = |\{"request_id":"{ ev_req_id }","aufnr":"{ iv_aufnr }",|
+           && |"appr_level":"{ iv_appr_level }",|
            && |"requestor":"{ iv_requestor }","items":[|.
 
     LOOP AT it_items ASSIGNING FIELD-SYMBOL(<ls>).
@@ -656,6 +679,7 @@ CLASS teams_in_handler IMPLEMENTATION.
         aufnr        = iv_aufnr
         teams_req_id = ev_req_id
         teams_status = 'SENT'
+        appr_level   = iv_appr_level   " LVL1 or LVL3
         werks        = <row>-werks
         sent_by      = iv_requestor
         sent_at      = lv_now
@@ -681,6 +705,7 @@ CLASS teams_in_handler IMPLEMENTATION.
 
     GET TIME STAMP FIELD DATA(lv_now).
 
+    " ── 1. Update Teams tracking table ──────────────────────────────────
     UPDATE ztwo_appr_tms
        SET appr_valid   = lv_flag
            teams_status = lv_status
@@ -694,6 +719,33 @@ CLASS teams_in_handler IMPLEMENTATION.
     IF sy-subrc <> 0.
       ev_error   = 'X'.
       ev_message = |No row found in ZTWO_APPR_TMS for WO { iv_aufnr } / { iv_req_id }|.
+      RETURN.
+    ENDIF.
+
+    " ── 2. Stamp the matching approval column in ZTWOAPPR ────────────────
+    " Only write the 'X' flag on APPROVED; leave blank for REJECTED/TIMEOUT.
+    IF iv_decision = 'APPROVED'.
+      CASE iv_appr_level.
+
+        WHEN 'LVL3'.
+          " SDH Branch Plant approved via Teams → set APPROVAL_LVL3
+          UPDATE ztwoappr
+             SET approval_lvl3  = 'X'
+                 appr_by_lvl3   = CONV appr_by_lvl3(  iv_approver )
+                 appr_date_lvl3 = sy-datum
+                 appr_time_lvl3 = sy-uzeit
+           WHERE aufnr = iv_aufnr.
+
+        WHEN 'LVL1'.
+          " HO ADM approved via Teams → set APPROVAL_LVL1
+          UPDATE ztwoappr
+             SET approval_lvl1  = 'X'
+                 appr_by_lvl1   = CONV appr_by_lvl1(  iv_approver )
+                 appr_date_lvl1 = sy-datum
+                 appr_time_lvl1 = sy-uzeit
+           WHERE aufnr = iv_aufnr.
+
+      ENDCASE.
     ENDIF.
 
   ENDMETHOD.
@@ -778,6 +830,7 @@ SE80 → right-click `ZFG_WO_APPR_TEAMS` → **Create → Function Module**
 |-----------|-----------|------|-----------|
 | `IV_AUFNR` | ✔ | TYPE | `AUFNR` |
 | `IV_REQUESTOR` | ✔ | TYPE | `SYUNAME` DEFAULT `SY-UNAME` |
+| `IV_APPR_LEVEL` | ✔ | TYPE | `CHAR4` DEFAULT `'LVL3'` |
 
 **Tables tab:**
 
@@ -808,6 +861,9 @@ FUNCTION z_wo_appr_teams_send.
 *"  IMPORTING
 *"     VALUE(IV_AUFNR) TYPE  AUFNR
 *"     VALUE(IV_REQUESTOR) TYPE  SYUNAME DEFAULT SY-UNAME
+*"     VALUE(IV_APPR_LEVEL) TYPE  CHAR4 DEFAULT 'LVL3'
+*"       " LVL3 = SDH Branch Plant (workers → SDH)
+*"       " LVL1 = HO ADM (Branch L4 → HO, key 'ADM' in cmpPlantApproverMap)
 *"  TABLES
 *"      IT_ITEMS TYPE  TEAMS_IN_HANDLER=>TT_APPR_LINE
 *"  EXPORTING
@@ -828,13 +884,14 @@ FUNCTION z_wo_appr_teams_send.
   DATA(lo_handler) = NEW teams_in_handler( ).
 
   lo_handler->send_approval(
-    EXPORTING it_items     = it_items
-              iv_aufnr     = iv_aufnr
-              iv_requestor = iv_requestor
-    IMPORTING ev_req_id    = ev_req_id
-              ev_http_code = ev_http_code
-              ev_error     = lv_error
-              ev_message   = lv_message ).
+    EXPORTING it_items      = it_items
+              iv_aufnr      = iv_aufnr
+              iv_requestor  = iv_requestor
+              iv_appr_level = iv_appr_level
+    IMPORTING ev_req_id     = ev_req_id
+              ev_http_code  = ev_http_code
+              ev_error      = lv_error
+              ev_message    = lv_message ).
 
   IF lv_error = 'X'.
     RAISE http_error.
@@ -967,21 +1024,41 @@ FORM remind_items_via_teams.
     RETURN.
   ENDIF.
 
+  " ── Determine which approval level to request ──────────────────────────
+  " LVL3 = SDH Branch Plant (first approval, from workers)
+  " LVL1 = HO ADM (escalation after SDH has approved)
+  DATA: lv_appr_level TYPE char4,
+        lv_lvl3_done  TYPE char1.
+
+  SELECT SINGLE approval_lvl3 FROM ztwoappr
+    INTO @lv_lvl3_done
+    WHERE aufnr = @gv_aufnr.
+
+  IF lv_lvl3_done = 'X'.
+    lv_appr_level = 'LVL1'.   " SDH done → escalate to HO ADM
+  ELSE.
+    lv_appr_level = 'LVL3'.   " Send to SDH Branch Plant first
+  ENDIF.
+
   DATA: lv_req_id    TYPE char32,
         lv_http_code TYPE i.
 
   CALL FUNCTION 'Z_WO_APPR_TEAMS_SEND'
-    EXPORTING  iv_aufnr     = gv_aufnr
-               iv_requestor = sy-uname
-    TABLES     it_items     = lt_items
-    IMPORTING  ev_req_id    = lv_req_id
-               ev_http_code = lv_http_code
+    EXPORTING  iv_aufnr      = gv_aufnr
+               iv_requestor  = sy-uname
+               iv_appr_level = lv_appr_level
+    TABLES     it_items      = lt_items
+    IMPORTING  ev_req_id     = lv_req_id
+               ev_http_code  = lv_http_code
     EXCEPTIONS http_error    = 1
                payload_empty = 2.
 
   CASE sy-subrc.
     WHEN 0.
-      MESSAGE |Teams reminder sent. Request: { lv_req_id } (HTTP { lv_http_code })| TYPE 'S'.
+      DATA(lv_level_txt) = COND #( WHEN lv_appr_level = 'LVL1'
+                                   THEN 'HO ADM (LVL1)'
+                                   ELSE 'SDH Branch (LVL3)' ).
+      MESSAGE |Teams reminder sent to { lv_level_txt }. Request: { lv_req_id }| TYPE 'S'.
     WHEN 2.
       MESSAGE 'No items marked' TYPE 'I'.
     WHEN OTHERS.
@@ -1002,12 +1079,13 @@ Activate include + PAI module.
 ```
 MANDT        = <your client>
 AUFNR        = 0000004711
-TEAMS_REQ_ID = TESTREQ0000000000000000000000001
+TEAMS_REQ_ID = UTX-20260514083045-A1B2C3
 TEAMS_STATUS = SENT
+APPR_LEVEL   = LVL3
 SENT_BY      = <your user>
 ```
 
-### 12.2 Happy path — APPROVED
+### 12.2 Happy path — SDH approves (LVL3)
 
 ```http
 POST https://<host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
@@ -1017,8 +1095,9 @@ Content-Type: application/json
 {
   "request_id": "UTX-20260514083045-A1B2C3",
   "aufnr":      "0000004711",
+  "appr_level": "LVL3",
   "decision":   "APPROVED",
-  "approver":   "alice@unitedtractors.com",
+  "approver":   "demakb@unitedtractors.com",
   "comments":   "OK",
   "timestamp":  "2026-05-18T10:30:00Z"
 }
@@ -1026,21 +1105,44 @@ Content-Type: application/json
 
 Expected: `{"msgty":"S","message":"APPROVED processed successfully"}`
 
-Check SE16 → `ZTWO_APPR_TMS`: `APPR_VALID = X`, `TEAMS_STATUS = APPROVED`
+Check SE16 → `ZTWO_APPR_TMS`: `APPR_VALID = X`, `TEAMS_STATUS = APPROVED`, `APPR_LEVEL = LVL3`
+Check SE16 → `ZTWOAPPR`: `APPROVAL_LVL3 = X`, `APPR_BY_LVL3 = demakb@...`
 
-### 12.3 Blocked IP
+### 12.3 Happy path — HO ADM approves (LVL1)
+
+```http
+POST https://<host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+Authorization: Basic <base64(TEAMS_API:password)>
+Content-Type: application/json
+
+{
+  "request_id": "UTX-20260514090000-B3C4D5",
+  "aufnr":      "0000004711",
+  "appr_level": "LVL1",
+  "decision":   "APPROVED",
+  "approver":   "viandraf@unitedtractors.com",
+  "comments":   "Approved by HO ADM",
+  "timestamp":  "2026-05-18T09:00:00Z"
+}
+```
+
+Expected: `{"msgty":"S","message":"APPROVED processed successfully"}`
+
+Check SE16 → `ZTWOAPPR`: `APPROVAL_LVL1 = X`, `APPR_BY_LVL1 = viandraf@...`
+
+### 12.4 Blocked IP
 
 Delete `127.0.0.1` row from `ZAPIGWACL` for `TEAMS_IN_HANDLER`, retry Postman.
 
 Expected: `{"msgty":"E","message":"Your IP is not Authorize"}`
 
-### 12.4 Missing required field
+### 12.5 Missing required field
 
 ```json
 { "aufnr": "0000004711" }
 ```
 
-Expected: `{"msgty":"E","message":"Missing required fields: aufnr or status"}`
+Expected: `{"msgty":"E","message":"Missing required fields: aufnr or decision"}`
 
 ---
 
