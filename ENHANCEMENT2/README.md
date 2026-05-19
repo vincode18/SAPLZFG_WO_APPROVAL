@@ -41,7 +41,7 @@ TEAMS_IN_HANDLER->send_approval()
   │                               Power Automate HTTP POST
   │                                         │
   ◄─────────────────────────────────────────┘
-  /sap/bc/zwo_appr_teams/callback   (SICF)
+  /PTUT/Service/zwo_appr_teams   (SICF)
         │
         ▼
 TEAMS_IN_HANDLER (IF_HTTP_EXTENSION~HANDLE_REQUEST)
@@ -200,12 +200,12 @@ One row is inserted per item per send:
 ### 4.1 Endpoint
 
 ```
-POST https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+POST https://<sap-host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 Authorization: Basic <TEAMS_API user>
 Content-Type: application/json
 ```
 
-Bound to `TEAMS_IN_HANDLER` via SICF service `/sap/bc/zwo_appr_teams/callback`.
+Bound to `TEAMS_IN_HANDLER` via SICF service `/PTUT/Service/zwo_appr_teams`.
 
 ### 4.2 Callback JSON (Power Automate → SAP)
 
@@ -518,24 +518,26 @@ ENDFUNCTION.
 
 ### Step 8 — SICF Service (SICF)
 
-`SICF → default_host → sap → bc → right-click → New Sub-Element`
+> The system uses `PTUT → Service` as the parent for all API/callback services
+> (e.g. `ztest_ass`, `zztassapprh_cb`). Create the node there — **not** under `sap → bc`.
 
-1. Create node `zwo_appr_teams` under `bc`
-2. Create child node `callback` under `zwo_appr_teams`
-3. **Handler List** tab of `callback` → add: `TEAMS_IN_HANDLER`
-4. **Logon Data** tab → Logon procedure: Basic · Service user: `TEAMS_API`
-5. Right-click `callback` → **Activate**
+`SICF → default_host → PTUT → Service → right-click → New Sub-Element`
+
+1. Create node `zwo_appr_teams` directly under `Service`
+2. **Handler List** tab → add: `TEAMS_IN_HANDLER`
+3. **Logon Data** tab → Logon procedure: Basic · Service user: `TEAMS_API`
+4. Right-click `zwo_appr_teams` → **Activate**
 
 Result URL:
 ```
-https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+https://<sap-host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 ```
 
 **Service user `TEAMS_API` (PFCG role `Z_WO_APPR_API`):**
 
 | Auth object | Field | Value |
 |-------------|-------|-------|
-| `S_ICF` | `ICF_VALUE` | `/sap/bc/zwo_appr_teams/callback` |
+| `S_ICF` | `ICF_VALUE` | `/PTUT/Service/zwo_appr_teams` |
 | `S_RFC` | `RFC_NAME` | `ZFG_WO_APPROVAL` |
 | `S_RFC` | `RFC_TYPE` | `FUGR` |
 
@@ -641,7 +643,7 @@ ENDFORM.
 
 **Test — SDH approval (LVL3):**
 ```json
-POST /sap/bc/zwo_appr_teams/callback?sap-client=<client>
+POST /PTUT/Service/zwo_appr_teams?sap-client=<client>
 {
   "request_id": "UTX-20260514083045-A1B2C3",
   "aufnr":      "0000004711",
@@ -686,7 +688,7 @@ auto-released and the response will be:
 | `TEAMS_IN_HANDLER` | Class | SE24 | **Create** (inbound + outbound) |
 | `ZFG_WO_APPROVAL` | Function Group | SE80 | **Existing** — no new FG |
 | `Z_WO_APPR_TEAMS_SEND` | Function Module | SE37 | **Create** inside `ZFG_WO_APPROVAL` |
-| `/sap/bc/zwo_appr_teams/callback` | SICF service | SICF | **Create + activate** |
+| `/PTUT/Service/zwo_appr_teams` | SICF service | SICF | **Create + activate** |
 | `Z_WO_APPR_APIM_URL` | TVARVC entry | STVARV | **Maintain** |
 | `Z_WO_APPR_APIM_KEY` | TVARVC entry | STVARV | **Maintain** |
 | `Z_WO_APPR_API` | Role | PFCG | **Create** — assign to `TEAMS_API` |
@@ -710,7 +712,7 @@ auto-released and the response will be:
 - [ ] Create class `ZCL_BASE_HTTP` (SE24)
 - [ ] Create class `TEAMS_IN_HANDLER` (SE24)
 - [ ] Create FM `Z_WO_APPR_TEAMS_SEND` inside **existing** `ZFG_WO_APPROVAL` (SE80)
-- [ ] Create SICF service `/sap/bc/zwo_appr_teams/callback` (SICF)
+- [ ] Create SICF service `/PTUT/Service/zwo_appr_teams` (SICF)
 - [ ] Maintain `Z_WO_APPR_APIM_URL` + `Z_WO_APPR_APIM_KEY` in TVARVC (STVARV)
 - [ ] Add APIM egress IPs to `ZAPIGWACL` for `TEAMS_IN_HANDLER` (SM30)
 - [ ] Add `&RTMS` button to `ZSTAT_0300` (SE41)

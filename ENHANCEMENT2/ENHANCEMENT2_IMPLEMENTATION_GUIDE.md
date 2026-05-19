@@ -66,7 +66,7 @@ FORM remind_items_via_teams  (LZFG_WO_APPROVALF01)
                   Power Automate POSTs callback JSON
                                 │
                                 ▼
-           SICF: /sap/bc/zwo_appr_teams/callback
+           SICF: /PTUT/Service/zwo_appr_teams
                                 │
                                 ▼
            TEAMS_IN_HANDLER (IF_HTTP_EXTENSION)      ← inbound side
@@ -231,12 +231,12 @@ One row is inserted per item per send:
 ### 4.1 Endpoint
 
 ```
-POST https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+POST https://<sap-host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 Authorization: Basic <TEAMS_API user>
 Content-Type: application/json
 ```
 
-Bound to `TEAMS_IN_HANDLER` via SICF service `/sap/bc/zwo_appr_teams/callback`.
+Bound to `TEAMS_IN_HANDLER` via SICF service `/PTUT/Service/zwo_appr_teams`.
 
 ### 4.2 Callback JSON (Power Automate → SAP)
 
@@ -1222,40 +1222,37 @@ Activate the FM and the Function Group.
 
 **Transaction: SICF**
 
-1. Navigate: `default_host → sap → bc`
-2. Right-click `bc` → **New Sub-Element**:
+> The system uses `PTUT → Service` as the parent folder for all API/callback
+> services (e.g. `ztest_ass`, `zztassapprh_cb`). Create the new node there —
+> **not** under `sap → bc`.
+
+1. Navigate: `default_host → PTUT → Service`
+2. Right-click `Service` → **New Sub-Element**:
 
 | Field | Value |
 |-------|-------|
 | Name | `zwo_appr_teams` |
-| Description | `WO Teams Approval` |
+| Description | `WO Teams Approval — callback from Power Automate` |
 
-3. Right-click the new node → **New Sub-Element**:
+3. Open `zwo_appr_teams` → **Handler List** tab → add: **`TEAMS_IN_HANDLER`**
 
-| Field | Value |
-|-------|-------|
-| Name | `callback` |
-| Description | `Approval callback from Power Automate` |
-
-4. Open `callback` → **Handler List** tab → add: **`TEAMS_IN_HANDLER`**
-
-5. **Logon Data** tab:
+4. **Logon Data** tab:
    - Logon procedure: `Standard` + `Basic`
    - Service user: `TEAMS_API`
 
-6. Right-click `callback` → **Activate**
+5. Right-click `zwo_appr_teams` → **Activate**
 
 **Result — callback URL:**
 ```
-https://<sap-host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+https://<sap-host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 ```
 
 ### Service user TEAMS_API (PFCG — role Z_WO_APPR_API)
 
 | Auth object | Field | Value |
 |-------------|-------|-------|
-| `S_ICF` | `ICF_VALUE` | `/sap/bc/zwo_appr_teams/callback` |
-| `S_RFC` | `RFC_NAME` | `ZFG_WO_APPR_TEAMS` |
+| `S_ICF` | `ICF_VALUE` | `/PTUT/Service/zwo_appr_teams` |
+| `S_RFC` | `RFC_NAME` | `ZFG_WO_APPROVAL` |
 | `S_RFC` | `RFC_TYPE` | `FUGR` |
 
 No `SAP_ALL`. No `S_TCODE`.
@@ -1402,7 +1399,7 @@ SENT_BY      = <your user>
 ### 12.2 Happy path — SDH approves (LVL3)
 
 ```http
-POST https://<host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+POST https://<host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 Authorization: Basic <base64(TEAMS_API:password)>
 Content-Type: application/json
 
@@ -1425,7 +1422,7 @@ Check SE16 → `ZTWOAPPR`: `APPROVAL_LVL3 = X`, `APPR_BY_LVL3 = demakb@...`
 ### 12.3 Happy path — HO ADM approves (LVL1)
 
 ```http
-POST https://<host>:<port>/sap/bc/zwo_appr_teams/callback?sap-client=<client>
+POST https://<host>:<port>/PTUT/Service/zwo_appr_teams?sap-client=<client>
 Authorization: Basic <base64(TEAMS_API:password)>
 Content-Type: application/json
 
@@ -1471,7 +1468,7 @@ Expected: `{"msgty":"E","message":"Missing required fields: aufnr or decision"}`
 | `TEAMS_IN_HANDLER` | SE24 | Class | **Create** — single class (inbound + outbound) |
 | `ZFG_WO_APPROVAL` | SE80 | Function Group | **Existing** — no new FG |
 | `Z_WO_APPR_TEAMS_SEND` | SE37 | Function Module | **Create** inside `ZFG_WO_APPROVAL` |
-| `/sap/bc/zwo_appr_teams/callback` | SICF | ICF service | **Create + activate** |
+| `/PTUT/Service/zwo_appr_teams` | SICF | ICF service | **Create + activate** |
 | `Z_WO_APPR_APIM_URL` | STVARV | TVARVC entry | **Maintain** |
 | `Z_WO_APPR_APIM_KEY` | STVARV | TVARVC entry | **Maintain** |
 | `Z_WO_APPR_API` | PFCG | Role | **Create** — assign to `TEAMS_API` user |
