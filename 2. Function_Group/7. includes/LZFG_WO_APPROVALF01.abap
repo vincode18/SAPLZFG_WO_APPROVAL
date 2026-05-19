@@ -121,3 +121,65 @@ FORM load_reasons_from_tvarvc.
   ENDLOOP.
 
 ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& FORM remind_items_via_teams                  [ENHANCEMENT2]
+*& Sends marked TC rows to Power Automate for Teams-based approval.
+*& Level auto-determined: LVL3 (SDH) first, LVL1 (HO ADM) after SDH done.
+*&---------------------------------------------------------------------*
+FORM remind_items_via_teams.
+
+  DATA lt_items TYPE teams_in_handler=>tt_appr_line.
+
+  LOOP AT gt_items_tc INTO gs_items_tc WHERE mark = abap_true.
+    APPEND VALUE #(
+      aufnr = gs_items_tc-aufnr
+      werks = gs_items_tc-werks
+      maktx = gs_items_tc-maktx
+      bdmng = gs_items_tc-bdmng
+      meins = gs_items_tc-meins ) TO lt_items.
+  ENDLOOP.
+
+  IF lt_items IS INITIAL.
+    MESSAGE 'Mark at least one item before sending Teams reminder' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+  " Auto-determine approval level from ZTWOAPPR current state
+  DATA: lv_appr_level TYPE char4,
+        lv_lvl3_done  TYPE char1.
+
+  SELECT SINGLE approval_lvl3 FROM ztwoappr
+    INTO @lv_lvl3_done
+    WHERE aufnr = @gv_aufnr.
+
+  lv_appr_level = COND #( WHEN lv_lvl3_done = 'X' THEN 'LVL1'   " escalate to HO ADM
+                           ELSE                          'LVL3' ). " send to SDH first
+
+  DATA: lv_req_id    TYPE char32,
+        lv_http_code TYPE i.
+
+  CALL FUNCTION 'Z_WO_APPR_TEAMS_SEND'
+    EXPORTING  iv_aufnr      = gv_aufnr
+               iv_requestor  = sy-uname
+               iv_appr_level = lv_appr_level
+    TABLES     it_items      = lt_items
+    IMPORTING  ev_req_id     = lv_req_id
+               ev_http_code  = lv_http_code
+    EXCEPTIONS http_error    = 1
+               payload_empty = 2
+               OTHERS        = 3.
+
+  CASE sy-subrc.
+    WHEN 0.
+      DATA(lv_level_txt) = COND #( WHEN lv_appr_level = 'LVL1'
+                                   THEN 'HO ADM (LVL1)'
+                                   ELSE 'SDH Branch (LVL3)' ).
+      MESSAGE |Teams reminder sent to { lv_level_txt }. Request: { lv_req_id }| TYPE 'S'.
+    WHEN 2.
+      MESSAGE 'No items marked' TYPE 'I'.
+    WHEN OTHERS.
+      MESSAGE |Teams trigger failed — HTTP { lv_http_code }| TYPE 'E'.
+  ENDCASE.
+
+ENDFORM.

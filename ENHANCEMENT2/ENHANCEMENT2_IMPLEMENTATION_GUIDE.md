@@ -11,7 +11,7 @@
 > - **1 DDIC table** — `ZTWO_APPR_TMS` (business state)
 > - **IP whitelist** — existing table `ZAPIGWACL` (`API_NAME` + `EXT_IP` exact match)
 > - **3 Classes** — `ZCL_VND_JSON_TO_ABAP` · `ZCL_BASE_HTTP` · `TEAMS_IN_HANDLER`
-> - **1 Function Group + 1 FM** — `ZFG_WO_APPR_TEAMS` · `Z_WO_APPR_TEAMS_SEND`
+> - **1 FM** — `Z_WO_APPR_TEAMS_SEND` added to **existing** `ZFG_WO_APPROVAL`
 > - **1 SICF service** — the callback URL Power Automate POSTs to
 > - **Screen 0300 hook** — `&RTMS` button in existing program
 
@@ -34,7 +34,7 @@
 5. [Step 4 — Class ZCL_VND_JSON_TO_ABAP (from ZIP)](#5-step-4--class-zcl_vnd_json_to_abap-from-zip)
 6. [Step 5 — Class ZCL_BASE_HTTP](#6-step-5--class-zcl_base_http)
 7. [Step 6 — Class TEAMS_IN_HANDLER (single main class)](#7-step-6--class-teams_in_handler-single-main-class)
-8. [Step 7 — Function Group & FM Z_WO_APPR_TEAMS_SEND](#8-step-7--function-group--fm-z_wo_appr_teams_send)
+8. [Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)](#8-step-7--fm-z_wo_appr_teams_send-add-to-existing-zfg_wo_approval)
 9. [Step 8 — SICF Service](#9-step-8--sicf-service)
 10. [Step 9 — TVARVC + ZAPIGWACL entries](#10-step-9--tvarvc--zapigwacl-entries)
 11. [Step 10 — Hook into Screen 0300](#11-step-10--hook-into-screen-0300)
@@ -810,19 +810,22 @@ Activate. Resolve any syntax errors before moving on.
 
 ---
 
-## 8. Step 7 — Function Group & FM Z_WO_APPR_TEAMS_SEND
+## 8. Step 7 — FM Z_WO_APPR_TEAMS_SEND (add to existing ZFG_WO_APPROVAL)
 
 **Transaction: SE80**
 
-### 8.1 Create Function Group
+> **No new Function Group needed.** Add the FM directly to the existing pool
+> `ZFG_WO_APPROVAL` so it shares globals, includes, and the same transport as the rest of the program.
 
-1. SE80 → Function Group → Create → `ZFG_WO_APPR_TEAMS`
-2. Short text: `WO Approval — Teams Integration`
-3. Activate — SAP auto-creates `LZFG_WO_APPR_TEAMSTOP` + `LZFG_WO_APPR_TEAMSUXX`
+### 8.1 Create FM Z_WO_APPR_TEAMS_SEND
 
-### 8.2 Create FM Z_WO_APPR_TEAMS_SEND
+SE80 → expand `ZFG_WO_APPROVAL` → right-click **Function Modules** → **Create**
 
-SE80 → right-click `ZFG_WO_APPR_TEAMS` → **Create → Function Module**
+| Field | Value |
+|-------|-------|
+| Function module | `Z_WO_APPR_TEAMS_SEND` |
+| Short text | `Send WO items to Power Automate for Teams approval` |
+| Function group | `ZFG_WO_APPROVAL` ← **existing** |
 
 **Import tab:**
 
@@ -855,6 +858,10 @@ SE80 → right-click `ZFG_WO_APPR_TEAMS` → **Create → Function Module**
 **Source code:**
 
 ```abap
+*&---------------------------------------------------------------------*
+*& Function Module : Z_WO_APPR_TEAMS_SEND
+*& Function Group  : ZFG_WO_APPROVAL  (existing pool — no new FG)
+*&---------------------------------------------------------------------*
 FUNCTION z_wo_appr_teams_send.
 *"----------------------------------------------------------------------
 *"*"Local Interface:
@@ -1155,8 +1162,8 @@ Expected: `{"msgty":"E","message":"Missing required fields: aufnr or decision"}`
 | `ZCL_VND_JSON_TO_ABAP` | SE24 | Class | **Create** from ZIP |
 | `ZCL_BASE_HTTP` | SE24 | Class | **Create** |
 | `TEAMS_IN_HANDLER` | SE24 | Class | **Create** — single class (inbound + outbound) |
-| `ZFG_WO_APPR_TEAMS` | SE80 | Function Group | **Create** |
-| `Z_WO_APPR_TEAMS_SEND` | SE37 | Function Module | **Create** |
+| `ZFG_WO_APPROVAL` | SE80 | Function Group | **Existing** — no new FG |
+| `Z_WO_APPR_TEAMS_SEND` | SE37 | Function Module | **Create** inside `ZFG_WO_APPROVAL` |
 | `/sap/bc/zwo_appr_teams/callback` | SICF | ICF service | **Create + activate** |
 | `Z_WO_APPR_APIM_URL` | STVARV | TVARVC entry | **Maintain** |
 | `Z_WO_APPR_APIM_KEY` | STVARV | TVARVC entry | **Maintain** |
@@ -1164,6 +1171,8 @@ Expected: `{"msgty":"E","message":"Missing required fields: aufnr or decision"}`
 
 ---
 
-*Guide v3 — one class `TEAMS_IN_HANDLER` handles both inbound callback and
-outbound trigger. JSON parsed via `ZCL_VND_JSON_TO_ABAP->JSON_TO_ABAP`.
-IP whitelist via existing `ZAPIGWACL` table.*
+*Guide v5 — one class `TEAMS_IN_HANDLER` handles both inbound callback and
+outbound trigger. FM added to existing `ZFG_WO_APPROVAL` (no new FG).
+JSON parsed via `ZCL_VND_JSON_TO_ABAP->JSON_TO_ABAP`.
+IP whitelist via existing `ZAPIGWACL` table.
+Multi-level approval: `LVL3` (SDH Branch) and `LVL1` (HO ADM).*
